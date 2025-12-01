@@ -1005,12 +1005,19 @@ static webgpu_command ggml_webgpu_unary_op(webgpu_context & ctx, ggml_tensor * s
     };
 
     switch (unary_op) {
-        case GGML_UNARY_OP_XIELU:
-            params.push_back(static_cast<uint32_t>(ggml_get_op_params_f32(dst, 1)));  // alpha_n
-            params.push_back(static_cast<uint32_t>(ggml_get_op_params_f32(dst, 2)));  // alpha_p
-            params.push_back(static_cast<uint32_t>(ggml_get_op_params_f32(dst, 3)));  // beta
-            params.push_back(static_cast<uint32_t>(ggml_get_op_params_f32(dst, 4)));  // eps
+        case GGML_UNARY_OP_XIELU: {
+            // Get float parameters and reinterpret their bit patterns as uint32_t
+            // for passing through the params buffer
+            float alpha_n = ggml_get_op_params_f32(dst, 1);
+            float alpha_p = ggml_get_op_params_f32(dst, 2);
+            float beta = ggml_get_op_params_f32(dst, 3);
+            float eps = ggml_get_op_params_f32(dst, 4);
+            params.push_back(*reinterpret_cast<const uint32_t *>(&alpha_n));
+            params.push_back(*reinterpret_cast<const uint32_t *>(&alpha_p));
+            params.push_back(*reinterpret_cast<const uint32_t *>(&beta));
+            params.push_back(*reinterpret_cast<const uint32_t *>(&eps));
             break;
+        }
         default:
             break;
     }
@@ -2519,8 +2526,7 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                     case GGML_UNARY_OP_HARDSIGMOID:
                     case GGML_UNARY_OP_EXP:
                     case GGML_UNARY_OP_GELU_ERF:
-                        // TODO: Investigate XIELU numerical issues
-                        //case GGML_UNARY_OP_XIELU:
+                    case GGML_UNARY_OP_XIELU:
                         supports_op = supports_op =
                             (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && (src0->type == op->type);
                         break;
