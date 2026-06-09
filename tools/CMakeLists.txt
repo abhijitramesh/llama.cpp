@@ -13,6 +13,8 @@ llama_add_compile_flags()
 # tools
 
 if (EMSCRIPTEN)
+    # benchmarking tool, used to compare wasm backends (WebGPU/WebNN) in the browser
+    add_subdirectory(llama-bench)
 else()
     add_subdirectory(batched-bench)
     add_subdirectory(gguf-split)

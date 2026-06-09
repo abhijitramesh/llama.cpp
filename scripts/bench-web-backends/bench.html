@@ -1,0 +1,38 @@
+<!doctype html>
+<!-- generic runner for emscripten llama.cpp binaries, driven by query params:
+       ?bin=llama-bench            which .js to load (default llama-bench)
+       &args=-m /m.gguf -p 128     CLI arguments (URL-encoded)
+       &model=stories15M.gguf      file to fetch into MEMFS before main()
+       &webnn=cpu|gpu|npu          WebNN MLContext deviceType preference -->
+<html>
+<body>
+<script>
+const q = new URLSearchParams(location.search);
+if (q.get('webnn')) {
+    globalThis.GGML_WEBNN_DEVICE = q.get('webnn');
+}
+var Module = {
+    arguments: (q.get('args') || '').split(' ').filter(function(s) { return s.length > 0; }),
+    print: function(t) { console.log(t); },
+    printErr: function(t) { console.error(t); },
+    onExit: function(code) { console.log('BENCH_EXIT_CODE: ' + code); },
+    preRun: [function() {
+        const model = q.get('model');
+        if (!model) return;
+        addRunDependency('fetch-model');
+        fetch(model)
+            .then(function(r) { if (!r.ok) throw new Error('model fetch failed: ' + r.status); return r.arrayBuffer(); })
+            .then(function(buf) {
+                FS.writeFile('/' + model, new Uint8Array(buf));
+                console.log('BENCH_MODEL_STAGED: ' + buf.byteLength);
+                removeRunDependency('fetch-model');
+            })
+            .catch(function(e) { console.error('BENCH_MODEL_FETCH_FAILED', e); });
+    }],
+};
+const s = document.createElement('script');
+s.src = (q.get('bin') || 'llama-bench') + '.js';
+document.body.appendChild(s);
+</script>
+</body>
+</html>

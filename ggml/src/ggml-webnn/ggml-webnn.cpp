@@ -43,7 +43,21 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
         return 0;
     }
     try {
-        const context = await navigator.ml.createContext();
+        /* device preference (cpu/gpu/npu) can be set by the embedding page via
+           globalThis.GGML_WEBNN_DEVICE; falls back to the UA default context */
+        let context;
+        const pref = globalThis.GGML_WEBNN_DEVICE;
+        if (pref) {
+            try {
+                context = await navigator.ml.createContext({ deviceType : pref });
+                console.log('ggml-webnn: created MLContext with deviceType=' + pref);
+            } catch (e) {
+                console.warn('ggml-webnn: deviceType=' + pref + ' rejected, using default context:', e);
+            }
+        }
+        if (!context) {
+            context = await navigator.ml.createContext();
+        }
         const S = {
             context : context,
             graphs  : new Map(),
