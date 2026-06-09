@@ -239,6 +239,11 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_WEBNN)
+    # bring-up tests for the WebNN backend; full coverage via test-backend-ops -b WebNN
+    llama_build_and_test(test-webnn.cpp)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

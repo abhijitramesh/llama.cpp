@@ -50,6 +50,10 @@
 #include "ggml-webgpu.h"
 #endif
 
+#ifdef GGML_USE_WEBNN
+#include "ggml-webnn.h"
+#endif
+
 #ifdef GGML_USE_ZDNN
 #include "ggml-zdnn.h"
 #endif
@@ -132,6 +136,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_WEBGPU
         register_backend(ggml_backend_webgpu_reg());
+#endif
+#ifdef GGML_USE_WEBNN
+        register_backend(ggml_backend_webnn_reg());
 #endif
 #ifdef GGML_USE_ZDNN
         register_backend(ggml_backend_zdnn_reg());
