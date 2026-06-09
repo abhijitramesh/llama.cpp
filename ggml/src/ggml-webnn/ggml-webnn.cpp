@@ -100,7 +100,27 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
                     if (d.scale !== 1) {
                         t = b.linear(t, { alpha : d.scale, beta : 0 });
                     }
+                    if (x.length > 1) {
+                        t = b.add(t, x[1]); /* additive attention mask, broadcast over heads */
+                    }
                     out = b.softmax(t, d.in[0].length - 1);
+                    break;
+                }
+                case 'swiglu_split':
+                {
+                    const g = x[d.gate];
+                    const u = x[1 - d.gate];
+                    out = b.mul(b.mul(g, b.sigmoid(g)), u);
+                    break;
+                }
+                case 'swiglu':
+                {
+                    const s = d.in[0];
+                    const n = s[3] / 2;
+                    const sizes = [s[0], s[1], s[2], n];
+                    const g = b.slice(x[0], [0, 0, 0, d.swapped ? n : 0], sizes);
+                    const u = b.slice(x[0], [0, 0, 0, d.swapped ? 0 : n], sizes);
+                    out = b.mul(b.mul(g, b.sigmoid(g)), u);
                     break;
                 }
                 case 'rms_norm':
@@ -170,7 +190,8 @@ EM_ASYNC_JS(int, ggml_webnn_js_dispatch,
     }
 });
 
-static bool g_webnn_available = false;
+static bool   g_webnn_available  = false;
+static size_t g_webnn_n_dispatch = 0; // ops executed on WebNN, reported on backend free
 
 //
 // op -> graph descriptor encoding
@@ -263,6 +284,18 @@ static bool ggml_webnn_encode_desc(const ggml_tensor * node, std::string & desc,
             desc_simple("\"op\":\"rms_norm\",\"eps\":" + ggml_webnn_float_js(eps));
             return true;
         }
+        case GGML_OP_GLU:
+        {
+            // SWIGLU only (checked by supports_op); silu is applied to the gate
+            int32_t swapped;
+            memcpy(&swapped, (const int32_t *) node->op_params + 1, sizeof(swapped));
+            if (src1) {
+                desc_simple("\"op\":\"swiglu_split\",\"gate\":" + std::to_string(swapped ? 1 : 0));
+            } else {
+                desc_simple("\"op\":\"swiglu\",\"swapped\":" + std::to_string(swapped ? 1 : 0));
+            }
+            return true;
+        }
         case GGML_OP_GET_ROWS:
             // 2D src, 1D i32 indices (enforced by supports_op)
             desc = "{\"op\":\"get_rows\",\"in\":[" + ggml_webnn_shape_js(src0, 2) + "," +
@@ -313,6 +346,7 @@ static const char * ggml_backend_webnn_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_webnn_free(ggml_backend_t backend) {
+    GGML_LOG_INFO("ggml-webnn: %zu ops were dispatched to WebNN\n", g_webnn_n_dispatch);
     delete backend;
 }
 
@@ -330,6 +364,12 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
             case GGML_OP_VIEW:
             case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
+                continue;
+            case GGML_OP_CPY:
+            case GGML_OP_CONT:
+            case GGML_OP_DUP:
+                // same type + contiguous (checked by supports_op): plain host memcpy
+                memcpy(node->data, node->src[0]->data, ggml_nbytes(node->src[0]));
                 continue;
             default:
                 break;
@@ -357,6 +397,8 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
             GGML_LOG_ERROR("ggml-webnn: dispatch failed for op %s\n", ggml_op_desc(node));
             return GGML_STATUS_FAILED;
         }
+
+        g_webnn_n_dispatch++;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -538,14 +580,41 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_SOFT_MAX:
         {
-            // no mask, no attention sinks, no alibi
-            if (src1 != nullptr || op->src[2] != nullptr) {
+            // optional f32 mask; no attention sinks, no alibi
+            if (op->src[2] != nullptr) {
                 return false;
             }
             float max_bias;
             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
-            return max_bias == 0.0f && ggml_webnn_all_f32_contig(op);
+            if (max_bias != 0.0f || !ggml_webnn_all_f32_contig(op)) {
+                return false;
+            }
+            if (src1 != nullptr) {
+                // mask rows must match exactly; higher dims broadcast
+                if (src1->ne[0] != src0->ne[0] || src1->ne[1] != src0->ne[1]) {
+                    return false;
+                }
+                for (int i = 2; i < GGML_MAX_DIMS; i++) {
+                    if (src1->ne[i] != src0->ne[i] && src1->ne[i] != 1) {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
+
+        case GGML_OP_GLU:
+            return ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU &&
+                   ggml_webnn_all_f32_contig(op) &&
+                   (src1 == nullptr || ggml_are_same_shape(src0, src1));
+
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+            // same-type contiguous copies are a host memcpy
+            return src0->type == op->type &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_I32) &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(op);
 
         case GGML_OP_GET_ROWS:
             return op->type == GGML_TYPE_F32 &&

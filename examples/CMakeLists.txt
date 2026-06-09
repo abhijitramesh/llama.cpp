@@ -13,6 +13,8 @@ llama_add_compile_flags()
 # examples
 
 if (EMSCRIPTEN)
+    # minimal generation example, used to drive wasm backends (e.g. WebNN) end-to-end
+    add_subdirectory(simple)
 else()
     add_subdirectory(batched)
     add_subdirectory(debug)

@@ -10,9 +10,11 @@
 //   ADD / SUB / MUL / DIV         (incl. row-broadcast of src1)
 //   MUL_MAT                       (f32 x f32, incl. batch broadcast of src0)
 //   SCALE                         (y = scale*x + bias)
-//   SOFT_MAX                      (no mask, scale only)
+//   SOFT_MAX                      (scale + optional f32 mask, no alibi/sinks)
 //   RMS_NORM
 //   GET_ROWS                      (f32 src, i32 indices)
+//   GLU: SWIGLU                   (split and non-split)
+//   CPY / CONT / DUP              (same type, contiguous)
 //   UNARY: RELU, SIGMOID, TANH, GELU_ERF, SILU, NEG, ABS, EXP
 //   SQR, SQRT, LOG, SIN, COS
 //
@@ -234,6 +236,22 @@ int main() {
         }},
         { "soft_max", NMSE_COMPOSED, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
             return ggml_soft_max(ctx, new_input(ctx, "a", in, 64, 8, 2, 1));
+        }},
+        { "soft_max_masked", NMSE_COMPOSED, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // attention shape: kq [n_kv, n_tokens, n_head, 1], f32 mask broadcast over heads
+            ggml_tensor * kq   = new_input(ctx, "a", in, 80, 7, 4, 1);
+            ggml_tensor * mask = new_input(ctx, "m", in, 80, 7, 1, 1);
+            return ggml_soft_max_ext(ctx, kq, mask, 0.125f, 0.0f);
+        }},
+        { "swiglu_split", NMSE_COMPOSED, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // fused FFN activation used by llama-arch models
+            return ggml_swiglu_split(ctx, new_input(ctx, "g", in, 64, 5, 2, 1), new_input(ctx, "u", in, 64, 5, 2, 1));
+        }},
+        { "swiglu", NMSE_COMPOSED, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            return ggml_swiglu(ctx, new_input(ctx, "a", in, 128, 5, 2, 1));
+        }},
+        { "dup", NMSE_DEFAULT, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            return ggml_dup(ctx, new_input(ctx, "a", in, 64, 5, 4, 3));
         }},
         { "rms_norm", NMSE_COMPOSED, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
             return ggml_rms_norm(ctx, new_input(ctx, "a", in, 128, 4, 2, 1), 1e-6f);
