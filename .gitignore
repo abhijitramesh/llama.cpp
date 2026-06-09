@@ -145,3 +145,6 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# wasm backend benchmark outputs (scripts/bench-web-backends)
+bench-results*/
