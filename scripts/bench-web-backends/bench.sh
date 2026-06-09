@@ -81,6 +81,7 @@ run_config() { # $1 = name, $2 = bin dir, $3 = extra query, $4 = extra chrome fl
 
     sample_loop "$OUT/$name.samples.csv" "$prof" &
     local sampler_pid=$!
+    disown $sampler_pid 2>/dev/null
 
     local pm_pid=
     if [ "$have_powermetrics" = 1 ]; then

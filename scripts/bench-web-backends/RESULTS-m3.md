@@ -24,6 +24,32 @@ With Chrome's CoreML delegate explicitly enabled
 | webnn-gpu | 1111      | 32       | 17/45              |
 | webnn-npu | 1163      | 34       | 13/31              |
 
+## Power (sudo powermetrics, 1 Hz, system-wide mW averaged over each run)
+
+Default WebNN delegate (LiteRT):
+
+| config        | pp t/s | tg t/s | CPU mW | GPU mW | ANE mW | ~decode mJ/token |
+|---------------|--------|--------|--------|--------|--------|------------------|
+| cpu           | 1059   | 537    | 7413   | 93     | **0**  | ~14              |
+| webnn-default | 1213   | 33     | 8372   | 36     | **0**  | ~250             |
+| webnn-cpu     | 1244   | 35     | 7822   | 0      | **0**  | ~225             |
+| webnn-gpu     | 1208   | 32     | 7693   | 22     | **0**  | ~240             |
+| webnn-npu     | 1221   | 33     | 7388   | 14     | **0**  | ~220             |
+| webgpu        | 8734   | 301    | 5734   | 88     | **0**  | ~19              |
+
+CoreML delegate (`WebNNCoreML,WebNNCoreMLExplicitGPUOrNPU`):
+
+| config        | pp t/s | tg t/s | CPU mW | GPU mW | ANE mW |
+|---------------|--------|--------|--------|--------|--------|
+| webnn-default | 1179   | 34     | 8606   | 107    | **0**  |
+| webnn-gpu     | 1192   | 32     | 8470   | 113    | **0**  |
+| webnn-npu     | 1202   | 35     | 8037   | 48     | **0**  |
+
+(CPU power is system-wide; idle floor on this machine was ~4 W during the
+session, so deltas between configs are the meaningful signal. GPU power
+stays near idle even for WebGPU at 77% busy — 24M-param f32 kernels are
+too small to raise the GPU's DVFS state; peak GPU sample was 257 mW.)
+
 ## Findings
 
 1. **WebGPU wins prefill by ~7.5x** over WebNN (8952 vs ~1200 t/s) and is
@@ -54,12 +80,20 @@ With Chrome's CoreML delegate explicitly enabled
 5. **Accelerator reach** — the question this was built to answer:
    WebGPU can only ever use the GPU. WebNN is the only path with a
    *mechanism* to reach the Apple Neural Engine (CoreML delegate,
-   deviceType=npu), but (a) it's behind extra Chrome feature flags, (b)
-   ANE engagement can only be confirmed with `sudo powermetrics`
-   (ANE Power counter), and (c) CoreML decides unilaterally whether to
-   use ANE/GPU/CPU per graph — f32 graphs typically do NOT go to the ANE
-   (it prefers f16), so f16 support in the backend is a prerequisite for
-   any real ANE benefit.
+   deviceType=npu), but powermetrics shows **ANE Power = 0 mW in every
+   configuration measured**, including deviceType=npu with the CoreML
+   delegate force-enabled. CoreML routed these graphs to CPU (plus a
+   little GPU). Expected reasons: the prototype emits tiny single-op f32
+   graphs, and the ANE strongly prefers f16 and only pays off for
+   compiled multi-op graphs. f16 + whole-graph compilation are
+   prerequisites before WebNN's NPU story can even be tested.
+
+6. **Energy**: WebGPU is the most efficient by a wide margin — lowest
+   system CPU power (5.7 W vs 7.4-8.6 W) at 8x the prefill throughput
+   (~0.7 mJ/token prefill vs ~7 for CPU and WebNN). For decode, plain
+   CPU is the most efficient (~14 mJ/token); per-op WebNN burns ~16x
+   more energy per generated token (~230 mJ) than CPU for the same
+   result — overhead, not useful work.
 
 ## Caveats
 
