@@ -61,15 +61,40 @@ static void fill_tensor(ggml_tensor * t, uint32_t seed) {
         ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(int32_t));
         return;
     }
-    GGML_ASSERT(t->type == GGML_TYPE_F32);
     const bool positive = strstr(t->name, "_pos") != nullptr;
     uint32_t state = seed;
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> data(n);
+        for (int64_t i = 0; i < n; i++) {
+            const float v = frand(state);
+            data[i] = ggml_fp32_to_fp16(positive ? fabsf(v) + 0.5f : v);
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(ggml_fp16_t));
+        return;
+    }
+    GGML_ASSERT(t->type == GGML_TYPE_F32);
     std::vector<float> data(n);
     for (int64_t i = 0; i < n; i++) {
         const float v = frand(state);
         data[i] = positive ? fabsf(v) + 0.5f : v;
     }
     ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(float));
+}
+
+static std::vector<float> read_tensor_f32(const ggml_tensor * t) {
+    const int64_t n = ggml_nelements(t);
+    std::vector<float> out(n);
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> raw(n);
+        ggml_backend_tensor_get(t, raw.data(), 0, n*sizeof(ggml_fp16_t));
+        for (int64_t i = 0; i < n; i++) {
+            out[i] = ggml_fp16_to_fp32(raw[i]);
+        }
+    } else {
+        GGML_ASSERT(t->type == GGML_TYPE_F32);
+        ggml_backend_tensor_get(t, out.data(), 0, n*sizeof(float));
+    }
+    return out;
 }
 
 static double nmse(const std::vector<float> & ref, const std::vector<float> & out) {
@@ -128,9 +153,7 @@ static bool run_case(ggml_backend_t backend, const webnn_test_case & tc, bool ch
         return false;
     }
 
-    GGML_ASSERT(out->type == GGML_TYPE_F32);
-    result.resize(ggml_nelements(out));
-    ggml_backend_tensor_get(out, result.data(), 0, result.size()*sizeof(float));
+    result = read_tensor_f32(out);
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -175,6 +198,48 @@ static bool test_buffer_roundtrip(ggml_backend_t backend) {
     return ok;
 }
 
+// after graph_compute, EVERY node's data must be valid in host memory - the
+// scheduler and other backends read intermediate tensors across split
+// boundaries (this pins the contract for whole-graph backend execution)
+static bool test_intermediate_readback(ggml_backend_t webnn, ggml_backend_t cpu) {
+    std::vector<float> mid_ref, out_ref, mid_out, out_out;
+
+    for (int pass = 0; pass < 2; pass++) {
+        ggml_backend_t backend = pass == 0 ? cpu : webnn;
+        ggml_init_params params = {
+            /* .mem_size   = */ ggml_tensor_overhead()*16 + ggml_graph_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+        ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+        ggml_tensor * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+        ggml_tensor * mid = ggml_mul(ctx, x, y);
+        ggml_tensor * out = ggml_add(ctx, mid, z);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        fill_tensor(x, 11);
+        fill_tensor(y, 22);
+        fill_tensor(z, 33);
+
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return false;
+        }
+        (pass == 0 ? mid_ref : mid_out) = read_tensor_f32(mid);
+        (pass == 0 ? out_ref : out_out) = read_tensor_f32(out);
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    return nmse(mid_ref, mid_out) <= NMSE_DEFAULT && nmse(out_ref, out_out) <= NMSE_DEFAULT;
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -200,6 +265,13 @@ int main() {
     {
         const bool ok = test_buffer_roundtrip(webnn);
         printf("  %-24s %s\n", "buffer_roundtrip", ok ? "OK" : "FAIL");
+        ok ? n_ok++ : n_fail++;
+    }
+
+    // 2b. intermediate tensors must be readable after graph_compute
+    {
+        const bool ok = test_intermediate_readback(webnn, cpu);
+        printf("  %-24s %s\n", "intermediate_readback", ok ? "OK" : "FAIL");
         ok ? n_ok++ : n_fail++;
     }
 
@@ -306,6 +378,31 @@ int main() {
             ggml_tensor * w1 = new_input(ctx, "w1", in, 64, 128);
             ggml_tensor * w2 = new_input(ctx, "w2", in, 128, 32);
             return ggml_mul_mat(ctx, w2, ggml_silu(ctx, ggml_mul_mat(ctx, w1, x)));
+        }},
+        { "mlp_reshape_chain", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // in-graph reshape between compute nodes
+            ggml_tensor * x  = new_input(ctx, "x",  in, 64, 4);
+            ggml_tensor * w1 = new_input(ctx, "w1", in, 64, 128);
+            ggml_tensor * w2 = new_input(ctx, "w2", in, 64, 32);
+            ggml_tensor * h  = ggml_silu(ctx, ggml_mul_mat(ctx, w1, x)); // [128, 4]
+            return ggml_mul_mat(ctx, w2, ggml_reshape_2d(ctx, h, 64, 8)); // [32, 8]
+        }},
+        { "add_f16", NMSE_DEFAULT, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            return ggml_add(ctx, new_input(ctx, "a", in, 64, 5, 4, 3, GGML_TYPE_F16),
+                                 new_input(ctx, "b", in, 64, 5, 4, 3, GGML_TYPE_F16));
+        }},
+        { "relu_f16", NMSE_DEFAULT, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            return ggml_relu(ctx, new_input(ctx, "a", in, 128, 5, 2, 1, GGML_TYPE_F16));
+        }},
+        { "mul_mat_f16", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // f16 weights x f32 activations -> f32, the standard f16-model matmul
+            return ggml_mul_mat(ctx, new_input(ctx, "w", in, 256, 32, 1, 1, GGML_TYPE_F16),
+                                     new_input(ctx, "x", in, 256, 16));
+        }},
+        { "get_rows_f16", NMSE_DEFAULT, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            ggml_tensor * src = new_input(ctx, "a", in, 64, 16, 1, 1, GGML_TYPE_F16);
+            ggml_tensor * idx = new_input(ctx, "i", in, 8, 1, 1, 1, GGML_TYPE_I32);
+            return ggml_get_rows(ctx, src, idx);
         }},
     };
 

@@ -58,15 +58,16 @@ sample_loop() { # $1 = csv out, $2 = user-data-dir to attribute CPU%
     done
 }
 
-run_config() { # $1 = name, $2 = bin dir, $3 = extra query, $4 = extra chrome flags
-    local name=$1 bindir=$2 query=$3 flags=$4
+run_config() { # $1 = name, $2 = bin dir, $3 = model file, $4 = extra query, $5 = extra chrome flags
+    local name=$1 bindir=$2 model=$3 query=$4 flags=$5
+    local bench_args="-m /$model -p 128 -n 64 -r 3${EXTRA_ARGS:+ $EXTRA_ARGS}"
 
     if [ ! -f "$bindir/llama-bench.js" ]; then
         echo "[$name] SKIP: $bindir/llama-bench.js not found"
         return
     fi
-    if [ ! -f "$bindir/$MODEL" ]; then
-        echo "[$name] SKIP: $bindir/$MODEL not found"
+    if [ ! -f "$bindir/$model" ]; then
+        echo "[$name] SKIP: $bindir/$model not found"
         return
     fi
 
@@ -90,8 +91,8 @@ run_config() { # $1 = name, $2 = bin dir, $3 = extra query, $4 = extra chrome fl
         pm_pid=$!
     fi
 
-    local args_enc; args_enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$BENCH_ARGS")
-    local url="http://localhost:$PORT/bench.html?model=$MODEL&args=$args_enc$query"
+    local args_enc; args_enc=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$bench_args")
+    local url="http://localhost:$PORT/bench.html?model=$model&args=$args_enc$query"
 
     echo "[$name] $url"
     local t0; t0=$(date +%s)
@@ -132,16 +133,26 @@ run_config() { # $1 = name, $2 = bin dir, $3 = extra query, $4 = extra chrome fl
     echo "[$name] done in $((t1 - t0))s"
 }
 
-CONFIGS="${*:-cpu webnn-default webnn-cpu webnn-gpu webnn-npu webgpu}"
+MODEL_F16="${MODEL_F16:-stories15M-f16.gguf}"
+WEBNN_COREML="--enable-features=WebMachineLearningNeuralNetwork,WebNNCoreML,WebNNCoreMLExplicitGPUOrNPU"
+WNN="$ROOT/build-webnn/bin"
+WGP="$ROOT/build-webgpu/bin"
+
+CONFIGS="${*:-cpu cpu-f16 webnn-default webnn-cpu webnn-gpu webnn-npu webnn-gpu-f16 webnn-npu-f16 webgpu webgpu-f16}"
 
 for cfg in $CONFIGS; do
     case "$cfg" in
-        cpu)           run_config cpu           "$ROOT/build-webnn/bin"  ""             "" ;;
-        webnn-default) run_config webnn-default "$ROOT/build-webnn/bin"  ""             "$WEBNN_FLAG" ;;
-        webnn-cpu)     run_config webnn-cpu     "$ROOT/build-webnn/bin"  "&webnn=cpu"   "$WEBNN_FLAG" ;;
-        webnn-gpu)     run_config webnn-gpu     "$ROOT/build-webnn/bin"  "&webnn=gpu"   "$WEBNN_FLAG" ;;
-        webnn-npu)     run_config webnn-npu     "$ROOT/build-webnn/bin"  "&webnn=npu"   "$WEBNN_FLAG" ;;
-        webgpu)        BENCH_ARGS="$BENCH_ARGS -ngl 99" run_config webgpu "$ROOT/build-webgpu/bin" "" "" ;;
+        cpu)            run_config cpu            "$WNN" "$MODEL"     ""           "" ;;
+        cpu-f16)        run_config cpu-f16        "$WNN" "$MODEL_F16" ""           "" ;;
+        webnn-default)  run_config webnn-default  "$WNN" "$MODEL"     ""           "$WEBNN_FLAG" ;;
+        webnn-cpu)      run_config webnn-cpu      "$WNN" "$MODEL"     "&webnn=cpu" "$WEBNN_FLAG" ;;
+        webnn-gpu)      run_config webnn-gpu      "$WNN" "$MODEL"     "&webnn=gpu" "$WEBNN_COREML" ;;
+        webnn-npu)      run_config webnn-npu      "$WNN" "$MODEL"     "&webnn=npu" "$WEBNN_COREML" ;;
+        # f16 model + f16 matmul compute + CoreML delegate: the ANE-friendly setup
+        webnn-gpu-f16)  run_config webnn-gpu-f16  "$WNN" "$MODEL_F16" "&webnn=gpu&f16=1" "$WEBNN_COREML" ;;
+        webnn-npu-f16)  run_config webnn-npu-f16  "$WNN" "$MODEL_F16" "&webnn=npu&f16=1" "$WEBNN_COREML" ;;
+        webgpu)         EXTRA_ARGS="-ngl 99" run_config webgpu     "$WGP" "$MODEL"     "" "" ;;
+        webgpu-f16)     EXTRA_ARGS="-ngl 99" run_config webgpu-f16 "$WGP" "$MODEL_F16" "" "" ;;
         *) echo "unknown config: $cfg" ;;
     esac
 done

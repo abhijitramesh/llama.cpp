@@ -6,7 +6,12 @@ import re
 import sys
 from pathlib import Path
 
-CONFIG_ORDER = ["cpu", "webnn-default", "webnn-cpu", "webnn-gpu", "webnn-npu", "webgpu"]
+CONFIG_ORDER = [
+    "cpu", "cpu-f16",
+    "webnn-default", "webnn-cpu", "webnn-gpu", "webnn-npu",
+    "webnn-gpu-f16", "webnn-npu-f16",
+    "webgpu", "webgpu-f16",
+]
 
 
 def parse_chrome_log(path: Path):

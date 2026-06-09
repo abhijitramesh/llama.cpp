@@ -6,13 +6,22 @@
 // Emscripten-only and talks to the browser through EM_ASYNC_JS bindings (which
 // require JSPI or ASYNCIFY to suspend the wasm stack across JS promises).
 //
-// Initial design (correctness over speed):
+// Design (v2 - whole-graph compilation):
 //  - tensor data lives in host (wasm heap) memory, reusing the CPU buffer type
-//  - graph_compute dispatches each ggml node as a single-op WebNN graph
-//  - compiled MLGraphs and their MLTensor handles are cached per op signature
-//    (op + shapes + params), so steady-state cost is write/dispatch/read
+//  - graph_compute translates each scheduler split it receives into a single
+//    WebNN MLGraph (compiled once, cached by a pointer-free descriptor that
+//    captures ops, dtypes, shapes, params and topology)
+//  - graph inputs get pooled MLTensors keyed by host pointer; tensors living
+//    in WEIGHTS buffers are uploaded once and reused across dispatches
+//  - every node's result is declared a graph output and written back to host
+//    memory after dispatch: the scheduler and other backends may read any
+//    intermediate tensor across split boundaries
+//  - f32 and f16 tensors are supported; mixed matmuls cast up to f32 by
+//    default, or down to f16 when globalThis.GGML_WEBNN_FORCE_F16 is set by
+//    the embedding page (relevant for NPU/ANE experiments)
 //
-// Future work: device-resident MLTensors, whole-cgraph compilation, f16/quants.
+// Future work: device-resident buffers (skip host writeback), quantized
+// weights via dequantizeLinear, ROPE/attention coverage.
 
 #include "ggml-webnn.h"
 
@@ -24,7 +33,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
+#include <vector>
 
 #ifdef GGML_WEBNN_DEBUG
 #    define WEBNN_LOG_DEBUG(...) GGML_LOG_DEBUG(__VA_ARGS__)
@@ -36,7 +47,7 @@
 // JS bindings
 //
 
-// create the MLContext and install the graph cache + builder on globalThis.
+// create the MLContext and install the graph/tensor caches on globalThis.
 // returns 1 on success, 0 when WebNN is unavailable.
 EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
     if (typeof navigator === 'undefined' || !navigator.ml) {
@@ -60,107 +71,160 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
         }
         const S = {
             context : context,
-            graphs  : new Map(),
+            graphs  : new Map(), /* desc string -> {graph, ext, inKeys, outTensors, outFeeds} */
+            tpool   : new Map(), /* 'ptr|dt|shape' -> {t: MLTensor, written: bool} */
         };
-        /* build (or fetch from cache) the single-op graph described by descStr.
-           desc format: {op, in: [jsShape, ...], dt: [dataType, ...]?, out: jsShape, ...params}
-           input i of the graph is named 'i' + i; the single output is named 'out'. */
-        S.getEntry = async function(descStr) {
-            let entry = S.graphs.get(descStr);
-            if (entry) {
-                return entry;
-            }
+        /* compile the multi-op graph described by descStr:
+           { f16, ext:[{dt,shape}...], nodes:[{op,dt,shape,src,ss,sl?,...params}...], outs:[...] }
+           src ref < 0 means external input -(ref+1), otherwise an earlier node index.
+           ss[k] is the shape the consumer wants (reshape applied when it differs),
+           sl[k] is an optional element offset (1D slice of the producer). */
+        S.buildGraph = async function(descStr) {
             const d = JSON.parse(descStr);
             const b = new MLGraphBuilder(S.context);
-            const dts = d.dt || [];
-            const ins = [];
-            const x = [];
-            for (let i = 0; i < d.in.length; i++) {
-                const dataType = dts[i] || 'float32';
-                const shape = d.in[i];
-                ins.push({ name : 'i' + i, shape : shape, dataType : dataType });
-                x.push(b.input('i' + i, { dataType : dataType, shape : shape, dimensions : shape }));
-            }
-            let out;
-            switch (d.op) {
-                case 'add':
-                case 'sub':
-                case 'mul':
-                case 'div':
-                    out = b[d.op](x[0], x[1]);
-                    break;
-                case 'matmul':
-                {
-                    /* ggml mul_mat: dst[n,m] = dot(src0 row m, src1 row n)
-                       JS shapes are [b3, b2, rows, cols], so: matmul(src1, src0^T) */
-                    out = b.matmul(x[1], b.transpose(x[0], { permutation : [0, 1, 3, 2] }));
-                    break;
+            const ext = d.ext.map(function(e, i) {
+                return b.input('x' + i, { dataType : e.dt, shape : e.shape, dimensions : e.shape });
+            });
+            const ops = [];
+            const nel = function(s) { return s.reduce(function(a, v) { return a * v; }, 1); };
+            const same = function(a, c) { return a.length === c.length && a.every(function(v, i) { return v === c[i]; }); };
+            const srcDt = function(n, k) {
+                const r = n.src[k];
+                return r < 0 ? d.ext[-r - 1].dt : d.nodes[r].dt;
+            };
+            const srcOp = function(n, k, wantDt) {
+                const r = n.src[k];
+                let op, have;
+                if (r < 0) { op = ext[-r - 1]; have = d.ext[-r - 1].shape; }
+                else       { op = ops[r];      have = d.nodes[r].shape; }
+                const want = n.ss[k];
+                if (n.sl && n.sl[k] !== null && n.sl[k] !== undefined) {
+                    op = b.reshape(op, [nel(have)]);
+                    op = b.slice(op, [n.sl[k]], [nel(want)]);
+                    have = [nel(want)];
                 }
-                case 'unary':
-                    out = b[d.fn](x[0]);
-                    break;
-                case 'silu':
-                    out = b.mul(x[0], b.sigmoid(x[0]));
-                    break;
-                case 'sqr':
-                    out = b.mul(x[0], x[0]);
-                    break;
-                case 'linear':
-                    out = b.linear(x[0], { alpha : d.alpha, beta : d.beta });
-                    break;
-                case 'softmax':
-                {
-                    let t = x[0];
-                    if (d.scale !== 1) {
-                        t = b.linear(t, { alpha : d.scale, beta : 0 });
+                if (!same(have, want)) {
+                    op = b.reshape(op, want);
+                }
+                if (wantDt && srcDt(n, k) !== wantDt) {
+                    op = b.cast(op, wantDt);
+                }
+                return op;
+            };
+            for (let i = 0; i < d.nodes.length; i++) {
+                const n = d.nodes[i];
+                let out;
+                switch (n.op) {
+                    case 'add': case 'sub': case 'mul': case 'div':
+                        out = b[n.op](srcOp(n, 0, n.dt), srcOp(n, 1, n.dt));
+                        break;
+                    case 'matmul':
+                    {
+                        /* ggml mul_mat: dst[n,m] = dot(src0 row m, src1 row n)
+                           JS shapes are [b3, b2, rows, cols]: matmul(src1, src0^T) */
+                        const cdt = n.cdt || 'float32';
+                        const w = srcOp(n, 0, cdt);
+                        const a = srcOp(n, 1, cdt);
+                        out = b.matmul(a, b.transpose(w, { permutation : [0, 1, 3, 2] }));
+                        if (cdt !== n.dt) {
+                            out = b.cast(out, n.dt);
+                        }
+                        break;
                     }
-                    if (x.length > 1) {
-                        t = b.add(t, x[1]); /* additive attention mask, broadcast over heads */
+                    case 'unary':
+                        out = b[n.fn](srcOp(n, 0, n.dt));
+                        break;
+                    case 'silu':
+                    {
+                        const x = srcOp(n, 0, n.dt);
+                        out = b.mul(x, b.sigmoid(x));
+                        break;
                     }
-                    out = b.softmax(t, d.in[0].length - 1);
-                    break;
+                    case 'sqr':
+                    {
+                        const x = srcOp(n, 0, n.dt);
+                        out = b.mul(x, x);
+                        break;
+                    }
+                    case 'linear':
+                        out = b.linear(srcOp(n, 0, n.dt), { alpha : n.alpha, beta : n.beta });
+                        break;
+                    case 'softmax':
+                    {
+                        let t = srcOp(n, 0, n.dt);
+                        if (n.scale !== 1) {
+                            t = b.linear(t, { alpha : n.scale, beta : 0 });
+                        }
+                        if (n.src.length > 1) {
+                            t = b.add(t, srcOp(n, 1, n.dt)); /* additive attention mask */
+                        }
+                        out = b.softmax(t, n.shape.length - 1);
+                        break;
+                    }
+                    case 'rms_norm':
+                    {
+                        const x = srcOp(n, 0, n.dt);
+                        const ms = b.reduceMean(b.mul(x, x), { axes : [n.shape.length - 1], keepDimensions : true });
+                        const eps = b.constant({ dataType : 'float32', shape : [1], dimensions : [1] },
+                                               new Float32Array([n.eps]));
+                        out = b.div(x, b.sqrt(b.add(ms, eps)));
+                        break;
+                    }
+                    case 'swiglu_split':
+                    {
+                        const g = srcOp(n, n.gate, n.dt);
+                        const u = srcOp(n, 1 - n.gate, n.dt);
+                        out = b.mul(b.mul(g, b.sigmoid(g)), u);
+                        break;
+                    }
+                    case 'swiglu':
+                    {
+                        const x = srcOp(n, 0, n.dt);
+                        const s = n.ss[0];
+                        const half = s[3] / 2;
+                        const sizes = [s[0], s[1], s[2], half];
+                        const g = b.slice(x, [0, 0, 0, n.swapped ? half : 0], sizes);
+                        const u = b.slice(x, [0, 0, 0, n.swapped ? 0 : half], sizes);
+                        out = b.mul(b.mul(g, b.sigmoid(g)), u);
+                        break;
+                    }
+                    case 'get_rows':
+                    {
+                        out = b.gather(srcOp(n, 0, null), srcOp(n, 1, null), { axis : 0 });
+                        if (srcDt(n, 0) !== n.dt) {
+                            out = b.cast(out, n.dt);
+                        }
+                        break;
+                    }
+                    case 'copy':
+                    {
+                        const x = srcOp(n, 0, null);
+                        out = srcDt(n, 0) !== n.dt ? b.cast(x, n.dt) : b.identity(x);
+                        break;
+                    }
+                    default:
+                        throw new Error('unknown op ' + n.op);
                 }
-                case 'swiglu_split':
-                {
-                    const g = x[d.gate];
-                    const u = x[1 - d.gate];
-                    out = b.mul(b.mul(g, b.sigmoid(g)), u);
-                    break;
-                }
-                case 'swiglu':
-                {
-                    const s = d.in[0];
-                    const n = s[3] / 2;
-                    const sizes = [s[0], s[1], s[2], n];
-                    const g = b.slice(x[0], [0, 0, 0, d.swapped ? n : 0], sizes);
-                    const u = b.slice(x[0], [0, 0, 0, d.swapped ? 0 : n], sizes);
-                    out = b.mul(b.mul(g, b.sigmoid(g)), u);
-                    break;
-                }
-                case 'rms_norm':
-                {
-                    const ax = d.in[0].length - 1;
-                    const ms = b.reduceMean(b.mul(x[0], x[0]), { axes : [ax], keepDimensions : true });
-                    const eps = b.constant({ dataType : 'float32', shape : [1], dimensions : [1] },
-                                           new Float32Array([d.eps]));
-                    out = b.div(x[0], b.sqrt(b.add(ms, eps)));
-                    break;
-                }
-                case 'get_rows':
-                    out = b.gather(x[0], x[1], { axis : 0 });
-                    break;
-                default:
-                    throw new Error('unknown op ' + d.op);
+                ops.push(out);
             }
-            const graph = await b.build({ out : out });
-            const tensors = [];
-            for (const i of ins) {
-                tensors.push(await S.context.createTensor(
-                    { dataType : i.dataType, shape : i.shape, dimensions : i.shape, writable : true }));
+            const outputsObj = {};
+            for (const i of d.outs) {
+                outputsObj['n' + i] = ops[i];
             }
-            const outTensor = await S.context.createTensor(
-                { dataType : 'float32', shape : d.out, dimensions : d.out, readable : true });
-            entry = { graph : graph, inputs : tensors, outTensor : outTensor };
+            const graph = await b.build(outputsObj);
+            const outTensors = [];
+            const outFeeds = {};
+            for (const i of d.outs) {
+                const n = d.nodes[i];
+                const t = await S.context.createTensor(
+                    { dataType : n.dt, shape : n.shape, dimensions : n.shape, readable : true });
+                outTensors.push(t);
+                outFeeds['n' + i] = t;
+            }
+            const entry = {
+                graph : graph, ext : d.ext, outTensors : outTensors, outFeeds : outFeeds,
+                inKeys : d.ext.map(function(e) { return e.dt + '|' + e.shape.join('x'); }),
+            };
             S.graphs.set(descStr, entry);
             return entry;
         };
@@ -172,44 +236,84 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
     }
 });
 
-// execute one op: copy inputs from the wasm heap into MLTensors, dispatch the
-// cached graph, read the result back into the wasm heap. returns 0 on success.
-EM_ASYNC_JS(int, ggml_webnn_js_dispatch,
-            (const char * desc, void * p0, size_t n0, void * p1, size_t n1, void * pdst, size_t ndst), {
+// whether the embedding page requests f16 matmul compute (ANE-friendly)
+EM_JS(int, ggml_webnn_js_force_f16, (), {
+    return globalThis.GGML_WEBNN_FORCE_F16 ? 1 : 0;
+});
+
+// execute one compiled graph: upload changed inputs, dispatch, read all
+// outputs back into the wasm heap. in_tab is n_in x [ptr, nbytes, flags]
+// (flags bit0 = weight), out_tab is n_out x [ptr, nbytes]. returns 0 on success.
+EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
+            (const char * desc, void * in_tab, int n_in, void * out_tab, int n_out), {
     const S = globalThis.__ggml_webnn;
     try {
-        /* under JSPI the wasm ABI passes these as BigInt - coerce before any arithmetic */
-        const entry = await S.getEntry(UTF8ToString(Number(desc)));
-        const ptrs = [Number(p0), Number(p1)];
-        const lens = [Number(n0), Number(n1)];
-        pdst = Number(pdst);
-        ndst = Number(ndst);
+        /* under JSPI the wasm ABI passes these as BigInt - coerce before use */
+        const descStr = UTF8ToString(Number(desc));
+        const inT = Number(in_tab) >> 2;
+        const outT = Number(out_tab) >> 2;
+        n_in = Number(n_in);
+        n_out = Number(n_out);
+
+        let entry = S.graphs.get(descStr);
+        if (!entry) {
+            entry = await S.buildGraph(descStr);
+        }
+
         const feeds = {};
-        for (let i = 0; i < entry.inputs.length; i++) {
-            /* writeTensor copies synchronously, so a heap view is safe here */
-            S.context.writeTensor(entry.inputs[i], HEAPU8.subarray(ptrs[i], ptrs[i] + lens[i]));
-            feeds['i' + i] = entry.inputs[i];
+        for (let i = 0; i < n_in; i++) {
+            const ptr = HEAPU32[inT + i*3];
+            const nb = HEAPU32[inT + i*3 + 1];
+            const fl = HEAPU32[inT + i*3 + 2];
+            const key = ptr + '|' + entry.inKeys[i];
+            let rec = S.tpool.get(key);
+            if (!rec) {
+                const e = entry.ext[i];
+                rec = { t : await S.context.createTensor(
+                            { dataType : e.dt, shape : e.shape, dimensions : e.shape, writable : true }),
+                        written : false };
+                S.tpool.set(key, rec);
+            }
+            const isWeight = (fl & 1) !== 0;
+            if (!isWeight || !rec.written) {
+                /* writeTensor copies synchronously, so a heap view is safe here */
+                S.context.writeTensor(rec.t, HEAPU8.subarray(ptr, ptr + nb));
+                rec.written = true;
+            }
+            feeds['x' + i] = rec.t;
         }
-        S.context.dispatch(entry.graph, feeds, { out : entry.outTensor });
-        const buf = await S.context.readTensor(entry.outTensor);
-        if (buf.byteLength !== ndst) {
-            throw new Error('output size mismatch: ' + buf.byteLength + ' != ' + ndst);
+
+        S.context.dispatch(entry.graph, feeds, entry.outFeeds);
+
+        const bufs = await Promise.all(entry.outTensors.map(function(t) { return S.context.readTensor(t); }));
+        for (let j = 0; j < n_out; j++) {
+            /* HEAPU8/U32 are re-read after the awaits - memory may have grown */
+            HEAPU8.set(new Uint8Array(bufs[j]), HEAPU32[outT + j*2]);
         }
-        /* HEAPU8 is re-read here, after the await - memory may have grown */
-        HEAPU8.set(new Uint8Array(buf), pdst);
         return 0;
     } catch (e) {
-        console.error('ggml-webnn: dispatch failed:', e);
+        console.error('ggml-webnn: graph dispatch failed:', e);
         return 1;
     }
 });
 
 static bool   g_webnn_available  = false;
-static size_t g_webnn_n_dispatch = 0; // ops executed on WebNN, reported on backend free
+static bool   g_webnn_force_f16  = false;
+static size_t g_webnn_n_ops      = 0; // ggml nodes executed via WebNN
+static size_t g_webnn_n_dispatch = 0; // compiled-graph dispatches
 
 //
-// op -> graph descriptor encoding
+// graph descriptor encoding
 //
+
+static const char * ggml_webnn_dt(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32: return "float32";
+        case GGML_TYPE_F16: return "float16";
+        case GGML_TYPE_I32: return "int32";
+        default:            return nullptr;
+    }
+}
 
 // JS (row-major) shape of a ggml tensor: reversed ne, e.g. rank 4 -> [ne3,ne2,ne1,ne0]
 static std::string ggml_webnn_shape_js(const ggml_tensor * t, int rank = 4) {
@@ -244,58 +348,37 @@ static const char * ggml_webnn_unary_fn(const ggml_tensor * op) {
     }
 }
 
-// encode a node into a graph descriptor; returns false for unhandled ops.
-// the descriptor doubles as the graph cache key, so it must capture every
-// value that changes the compiled graph (op, shapes, dtypes, params).
-static bool ggml_webnn_encode_desc(const ggml_tensor * node, std::string & desc, int & n_inputs) {
-    const ggml_tensor * src0 = node->src[0];
-    const ggml_tensor * src1 = node->src[1];
-
-    n_inputs = src1 ? 2 : 1;
-
-    auto desc_simple = [&](const std::string & op_fields) {
-        desc = "{" + op_fields + ",\"in\":[" + ggml_webnn_shape_js(src0);
-        if (src1) {
-            desc += "," + ggml_webnn_shape_js(src1);
-        }
-        desc += "],\"out\":" + ggml_webnn_shape_js(node) + "}";
-    };
-
+// op-specific JSON fields ("op":... plus parameters), false for unhandled ops
+static bool ggml_webnn_op_fields(const ggml_tensor * node, std::string & fields) {
     switch (node->op) {
-        case GGML_OP_ADD:
-        case GGML_OP_SUB:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
-        {
-            const char * fn = node->op == GGML_OP_ADD ? "add" :
-                              node->op == GGML_OP_SUB ? "sub" :
-                              node->op == GGML_OP_MUL ? "mul" : "div";
-            desc_simple(std::string("\"op\":\"") + fn + "\"");
-            return true;
-        }
+        case GGML_OP_ADD: fields = "\"op\":\"add\""; return true;
+        case GGML_OP_SUB: fields = "\"op\":\"sub\""; return true;
+        case GGML_OP_MUL: fields = "\"op\":\"mul\""; return true;
+        case GGML_OP_DIV: fields = "\"op\":\"div\""; return true;
         case GGML_OP_MUL_MAT:
-            desc_simple("\"op\":\"matmul\"");
+            fields = std::string("\"op\":\"matmul\",\"cdt\":\"") +
+                     (g_webnn_force_f16 ? "float16" : "float32") + "\"";
             return true;
         case GGML_OP_SCALE:
         {
             float params[2]; // scale, bias
             memcpy(params, node->op_params, sizeof(params));
-            desc_simple("\"op\":\"linear\",\"alpha\":" + ggml_webnn_float_js(params[0]) +
-                        ",\"beta\":" + ggml_webnn_float_js(params[1]));
+            fields = "\"op\":\"linear\",\"alpha\":" + ggml_webnn_float_js(params[0]) +
+                     ",\"beta\":" + ggml_webnn_float_js(params[1]);
             return true;
         }
         case GGML_OP_SOFT_MAX:
         {
             float scale;
             memcpy(&scale, node->op_params, sizeof(scale));
-            desc_simple("\"op\":\"softmax\",\"scale\":" + ggml_webnn_float_js(scale));
+            fields = "\"op\":\"softmax\",\"scale\":" + ggml_webnn_float_js(scale);
             return true;
         }
         case GGML_OP_RMS_NORM:
         {
             float eps;
             memcpy(&eps, node->op_params, sizeof(eps));
-            desc_simple("\"op\":\"rms_norm\",\"eps\":" + ggml_webnn_float_js(eps));
+            fields = "\"op\":\"rms_norm\",\"eps\":" + ggml_webnn_float_js(eps);
             return true;
         }
         case GGML_OP_GLU:
@@ -303,46 +386,47 @@ static bool ggml_webnn_encode_desc(const ggml_tensor * node, std::string & desc,
             // SWIGLU only (checked by supports_op); silu is applied to the gate
             int32_t swapped;
             memcpy(&swapped, (const int32_t *) node->op_params + 1, sizeof(swapped));
-            if (src1) {
-                desc_simple("\"op\":\"swiglu_split\",\"gate\":" + std::to_string(swapped ? 1 : 0));
+            if (node->src[1]) {
+                fields = "\"op\":\"swiglu_split\",\"gate\":" + std::to_string(swapped ? 1 : 0);
             } else {
-                desc_simple("\"op\":\"swiglu\",\"swapped\":" + std::to_string(swapped ? 1 : 0));
+                fields = "\"op\":\"swiglu\",\"swapped\":" + std::to_string(swapped ? 1 : 0);
             }
             return true;
         }
-        case GGML_OP_GET_ROWS:
-            // 2D src, 1D i32 indices (enforced by supports_op)
-            desc = "{\"op\":\"get_rows\",\"in\":[" + ggml_webnn_shape_js(src0, 2) + "," +
-                   ggml_webnn_shape_js(src1, 1) + "],\"dt\":[\"float32\",\"int32\"],\"out\":" +
-                   ggml_webnn_shape_js(node, 2) + "}";
-            return true;
+        case GGML_OP_GET_ROWS: fields = "\"op\":\"get_rows\""; return true;
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:      fields = "\"op\":\"copy\""; return true;
         case GGML_OP_UNARY:
         {
             if (ggml_get_unary_op(node) == GGML_UNARY_OP_SILU) {
-                desc_simple("\"op\":\"silu\"");
+                fields = "\"op\":\"silu\"";
                 return true;
             }
             const char * fn = ggml_webnn_unary_fn(node);
             if (fn == nullptr) {
                 return false;
             }
-            desc_simple(std::string("\"op\":\"unary\",\"fn\":\"") + fn + "\"");
+            fields = std::string("\"op\":\"unary\",\"fn\":\"") + fn + "\"";
             return true;
         }
-        case GGML_OP_SQR:
-            desc_simple("\"op\":\"sqr\"");
-            return true;
-        case GGML_OP_SQRT:
-            desc_simple("\"op\":\"unary\",\"fn\":\"sqrt\"");
-            return true;
-        case GGML_OP_LOG:
-            desc_simple("\"op\":\"unary\",\"fn\":\"log\"");
-            return true;
-        case GGML_OP_SIN:
-            desc_simple("\"op\":\"unary\",\"fn\":\"sin\"");
-            return true;
-        case GGML_OP_COS:
-            desc_simple("\"op\":\"unary\",\"fn\":\"cos\"");
+        case GGML_OP_SQR:  fields = "\"op\":\"sqr\"";                       return true;
+        case GGML_OP_SQRT: fields = "\"op\":\"unary\",\"fn\":\"sqrt\"";     return true;
+        case GGML_OP_LOG:  fields = "\"op\":\"unary\",\"fn\":\"log\"";      return true;
+        case GGML_OP_SIN:  fields = "\"op\":\"unary\",\"fn\":\"sin\"";      return true;
+        case GGML_OP_COS:  fields = "\"op\":\"unary\",\"fn\":\"cos\"";      return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_webnn_is_noop(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
             return true;
         default:
             return false;
@@ -360,60 +444,176 @@ static const char * ggml_backend_webnn_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_webnn_free(ggml_backend_t backend) {
-    GGML_LOG_INFO("ggml-webnn: %zu ops were dispatched to WebNN\n", g_webnn_n_dispatch);
+    GGML_LOG_INFO("ggml-webnn: %zu ops were executed in %zu WebNN graph dispatches\n",
+                  g_webnn_n_ops, g_webnn_n_dispatch);
     delete backend;
 }
 
 static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    // 1. collect the compute nodes of this split
+    std::vector<ggml_tensor *> nodes;
+    std::map<const ggml_tensor *, int> node_idx;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
-
-        if (ggml_is_empty(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        if (ggml_webnn_is_noop(node) || ggml_is_empty(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+        node_idx[node] = (int) nodes.size();
+        nodes.push_back(node);
+    }
+    if (nodes.empty()) {
+        return GGML_STATUS_SUCCESS;
+    }
 
-        switch (node->op) {
-            case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                continue;
-            case GGML_OP_CPY:
-            case GGML_OP_CONT:
-            case GGML_OP_DUP:
-                // same type + contiguous (checked by supports_op): plain host memcpy
-                memcpy(node->data, node->src[0]->data, ggml_nbytes(node->src[0]));
-                continue;
-            default:
-                break;
+    // 2. translate into a graph descriptor (doubles as the compile cache key)
+    std::vector<std::string> ext_descs;
+    std::vector<uint32_t>    in_tab; // [ptr, nbytes, flags] per external input
+    std::map<std::string, int> ext_idx;
+
+    // resolve a src tensor to an operand reference:
+    //   ref < 0  -> external input -(ref+1)  (data read from host at dispatch)
+    //   ref >= 0 -> node index in this split (+ optional 1D element slice)
+    auto resolve = [&](const ggml_tensor * t, int rank, int & ref, int64_t & slice_off) -> bool {
+        // walk the view chain, stopping at the FIRST tensor that is a compute
+        // node of this split: in-place ops are views of their src0, so walking
+        // straight to the root would skip past the producing node
+        const ggml_tensor * owner = t;
+        auto it = node_idx.find(owner);
+        while (it == node_idx.end() && owner->view_src) {
+            owner = owner->view_src;
+            it = node_idx.find(owner);
         }
+        slice_off = -1;
+        if (it != node_idx.end()) {
+            if (owner->type != t->type) {
+                return false; // type-punning views are not supported
+            }
+            ref = it->second;
+            const size_t off_bytes = (const char *) t->data - (const char *) owner->data;
+            if (off_bytes != 0 || ggml_nelements(t) != ggml_nelements(owner)) {
+                if (off_bytes % ggml_type_size(t->type) != 0) {
+                    return false;
+                }
+                slice_off = (int64_t) (off_bytes / ggml_type_size(t->type));
+            }
+            return true;
+        }
+        // external input (leaf, weight, or a tensor computed outside this split)
+        const char * dt = ggml_webnn_dt(t->type);
+        if (dt == nullptr) {
+            return false;
+        }
+        const std::string shape = ggml_webnn_shape_js(t, rank);
+        char key[64];
+        snprintf(key, sizeof(key), "%p|%s|", t->data, dt);
+        const std::string k = key + shape;
+        auto eit = ext_idx.find(k);
+        int idx;
+        if (eit != ext_idx.end()) {
+            idx = eit->second;
+        } else {
+            idx = (int) ext_descs.size();
+            ext_idx[k] = idx;
+            ext_descs.push_back("{\"dt\":\"" + std::string(dt) + "\",\"shape\":" + shape + "}");
+            uint32_t flags = 0;
+            if (t->buffer && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                flags |= 1;
+            }
+            in_tab.push_back((uint32_t) (uintptr_t) t->data);
+            in_tab.push_back((uint32_t) ggml_nbytes(t));
+            in_tab.push_back(flags);
+        }
+        ref = -(idx + 1);
+        return true;
+    };
 
-        std::string desc;
-        int n_inputs = 0;
-        if (!ggml_webnn_encode_desc(node, desc, n_inputs)) {
+    std::string desc = "{\"f16\":";
+    desc += g_webnn_force_f16 ? "1" : "0";
+    desc += ",\"nodes\":[";
+
+    for (size_t i = 0; i < nodes.size(); i++) {
+        const ggml_tensor * node = nodes[i];
+
+        std::string fields;
+        if (!ggml_webnn_op_fields(node, fields)) {
             GGML_LOG_ERROR("ggml-webnn: unsupported op in graph: %s\n", ggml_op_desc(node));
             return GGML_STATUS_FAILED;
         }
 
-        WEBNN_LOG_DEBUG("ggml-webnn: dispatch %s\n", desc.c_str());
+        const int node_rank = node->op == GGML_OP_GET_ROWS ? 2 : 4;
 
-        const ggml_tensor * src0 = node->src[0];
-        const ggml_tensor * src1 = node->src[1];
+        // CPY carries its destination alias as src[1] - it is not a data input
+        const int n_srcs = node->op == GGML_OP_CPY ? 1 : GGML_MAX_SRC;
 
-        const int ret = ggml_webnn_js_dispatch(desc.c_str(),
-            src0->data, ggml_nbytes(src0),
-            n_inputs > 1 ? src1->data : nullptr,
-            n_inputs > 1 ? ggml_nbytes(src1) : 0,
-            node->data, ggml_nbytes(node));
-
-        if (ret != 0) {
-            GGML_LOG_ERROR("ggml-webnn: dispatch failed for op %s\n", ggml_op_desc(node));
-            return GGML_STATUS_FAILED;
+        std::string src_json = "[";
+        std::string ss_json  = "[";
+        std::string sl_json  = "[";
+        for (int k = 0; k < n_srcs && node->src[k]; k++) {
+            // per-src rank: GET_ROWS uses rank-2 data + rank-1 indices
+            const int rank = node->op == GGML_OP_GET_ROWS ? (k == 0 ? 2 : 1) : 4;
+            int ref;
+            int64_t slice_off;
+            if (!resolve(node->src[k], rank, ref, slice_off)) {
+                GGML_LOG_ERROR("ggml-webnn: cannot resolve src %d of %s\n", k, ggml_op_desc(node));
+                return GGML_STATUS_FAILED;
+            }
+            if (k > 0) {
+                src_json += ",";
+                ss_json += ",";
+                sl_json += ",";
+            }
+            src_json += std::to_string(ref);
+            ss_json  += ggml_webnn_shape_js(node->src[k], rank);
+            sl_json  += slice_off < 0 ? "null" : std::to_string(slice_off);
         }
+        src_json += "]";
+        ss_json += "]";
+        sl_json += "]";
 
-        g_webnn_n_dispatch++;
+        if (i > 0) {
+            desc += ",";
+        }
+        desc += "{" + fields +
+                ",\"dt\":\"" + ggml_webnn_dt(node->type) + "\"" +
+                ",\"shape\":" + ggml_webnn_shape_js(node, node_rank) +
+                ",\"src\":" + src_json +
+                ",\"ss\":" + ss_json +
+                ",\"sl\":" + sl_json + "}";
     }
+
+    // 3. every node is materialized back to host memory
+    desc += "],\"outs\":[";
+    std::vector<uint32_t> out_tab;
+    for (size_t i = 0; i < nodes.size(); i++) {
+        if (i > 0) {
+            desc += ",";
+        }
+        desc += std::to_string(i);
+        out_tab.push_back((uint32_t) (uintptr_t) nodes[i]->data);
+        out_tab.push_back((uint32_t) ggml_nbytes(nodes[i]));
+    }
+    desc += "],\"ext\":[";
+    for (size_t i = 0; i < ext_descs.size(); i++) {
+        if (i > 0) {
+            desc += ",";
+        }
+        desc += ext_descs[i];
+    }
+    desc += "]}";
+
+    WEBNN_LOG_DEBUG("ggml-webnn: dispatch %d nodes, %d inputs\n", (int) nodes.size(), (int) ext_descs.size());
+
+    const int ret = ggml_webnn_js_graph_dispatch(desc.c_str(),
+        in_tab.data(), (int) ext_descs.size(),
+        out_tab.data(), (int) nodes.size());
+
+    if (ret != 0) {
+        GGML_LOG_ERROR("ggml-webnn: graph dispatch failed (%d nodes)\n", (int) nodes.size());
+        return GGML_STATUS_FAILED;
+    }
+
+    g_webnn_n_ops += nodes.size();
+    g_webnn_n_dispatch++;
 
     return GGML_STATUS_SUCCESS;
 
@@ -523,8 +723,13 @@ static ggml_backend_buffer_t ggml_backend_webnn_device_buffer_from_host_ptr(ggml
     GGML_UNUSED(max_tensor_size);
 }
 
-static bool ggml_webnn_all_f32_contig(const ggml_tensor * op) {
-    if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+static bool ggml_webnn_is_float(ggml_type t) {
+    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16;
+}
+
+// op + all srcs: float dtype (f32/f16) and contiguous
+static bool ggml_webnn_all_float_contig(const ggml_tensor * op) {
+    if (!ggml_webnn_is_float(op->type) || !ggml_is_contiguous(op)) {
         return false;
     }
     for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -532,7 +737,7 @@ static bool ggml_webnn_all_f32_contig(const ggml_tensor * op) {
         if (src == nullptr) {
             break;
         }
-        if (src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src)) {
+        if (!ggml_webnn_is_float(src->type) || !ggml_is_contiguous(src)) {
             return false;
         }
     }
@@ -556,7 +761,7 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         {
-            if (!ggml_webnn_all_f32_contig(op)) {
+            if (!ggml_webnn_all_float_contig(op) || src0->type != op->type || src1->type != op->type) {
                 return false;
             }
             // WebNN broadcasts numpy-style: src1 dims must match or be 1
@@ -571,7 +776,8 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_MUL_MAT:
         {
-            if (!ggml_webnn_all_f32_contig(op)) {
+            // f32/f16 srcs in any combination, f32 dst
+            if (op->type != GGML_TYPE_F32 || !ggml_webnn_all_float_contig(op)) {
                 return false;
             }
             // batch dims must match or broadcast src0 across src1
@@ -585,25 +791,31 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_SCALE:
         case GGML_OP_RMS_NORM:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(op);
+
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_LOG:
         case GGML_OP_SIN:
         case GGML_OP_COS:
-            return ggml_webnn_all_f32_contig(op);
+            return src0->type == op->type && ggml_webnn_all_float_contig(op);
 
         case GGML_OP_SOFT_MAX:
         {
-            // optional f32 mask; no attention sinks, no alibi
-            if (op->src[2] != nullptr) {
+            // optional f32 mask; no attention sinks, no alibi; f32 only
+            if (op->src[2] != nullptr || op->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_F32) {
                 return false;
             }
             float max_bias;
             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
-            if (max_bias != 0.0f || !ggml_webnn_all_f32_contig(op)) {
+            if (max_bias != 0.0f || !ggml_is_contiguous(src0) || !ggml_is_contiguous(op)) {
                 return false;
             }
             if (src1 != nullptr) {
+                if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) {
+                    return false;
+                }
                 // mask rows must match exactly; higher dims broadcast
                 if (src1->ne[0] != src0->ne[0] || src1->ne[1] != src0->ne[1]) {
                     return false;
@@ -619,26 +831,31 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_GLU:
             return ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU &&
-                   ggml_webnn_all_f32_contig(op) &&
-                   (src1 == nullptr || ggml_are_same_shape(src0, src1));
+                   ggml_webnn_all_float_contig(op) &&
+                   src0->type == op->type &&
+                   (src1 == nullptr || (src1->type == op->type && ggml_are_same_shape(src0, src1)));
 
         case GGML_OP_CPY:
         case GGML_OP_CONT:
         case GGML_OP_DUP:
-            // same-type contiguous copies are a host memcpy
-            return src0->type == op->type &&
-                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_I32) &&
-                   ggml_is_contiguous(src0) && ggml_is_contiguous(op);
+            // float<->float copies (with cast), or same-type i32
+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(op)) {
+                return false;
+            }
+            if (ggml_webnn_is_float(src0->type) && ggml_webnn_is_float(op->type)) {
+                return true;
+            }
+            return src0->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32;
 
         case GGML_OP_GET_ROWS:
             return op->type == GGML_TYPE_F32 &&
-                   src0->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
+                   ggml_webnn_is_float(src0->type) && ggml_is_contiguous(src0) &&
                    src1->type == GGML_TYPE_I32 && ggml_is_contiguous(src1) &&
                    src0->ne[2] == 1 && src0->ne[3] == 1 &&
                    src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
 
         case GGML_OP_UNARY:
-            if (!ggml_webnn_all_f32_contig(op)) {
+            if (src0->type != op->type || !ggml_webnn_all_float_contig(op)) {
                 return false;
             }
             return ggml_get_unary_op(op) == GGML_UNARY_OP_SILU || ggml_webnn_unary_fn(op) != nullptr;
@@ -718,7 +935,12 @@ ggml_backend_reg_t ggml_backend_webnn_reg(void) {
     if (!initialized) {
         initialized = true;
         g_webnn_available = ggml_webnn_js_init() != 0;
-        if (!g_webnn_available) {
+        if (g_webnn_available) {
+            g_webnn_force_f16 = ggml_webnn_js_force_f16() != 0;
+            if (g_webnn_force_f16) {
+                GGML_LOG_INFO("ggml-webnn: matmuls will be computed in f16 (GGML_WEBNN_FORCE_F16)\n");
+            }
+        } else {
             GGML_LOG_WARN("ggml-webnn: navigator.ml is not available, WebNN backend disabled\n");
         }
     }
