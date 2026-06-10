@@ -76,8 +76,23 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
             graphs  : new Map(), /* desc string -> {graph, ext, inKeys, outInfo} */
             tpool   : new Map(), /* 'ptr|dt|shape' -> {t: MLTensor, written: bool} */
             resident : new Map(), /* 'r'+rootPtr -> {cur, alt, dt, shape} - device-resident regions (KV caches) */
+            chained : new Map(), /* 'c'+ptr -> {t, epoch, dt, shape, p} - segment-boundary tensors kept on device */
+            chainEpoch : 0,      /* chained records are only trusted within one graph_compute call */
+            pending : [],        /* enqueued readbacks {promise, ptr}, flushed in enqueue order */
+            pendingPtrs : new Set(),
             canScatter : !globalThis.GGML_WEBNN_NO_SCATTER &&
                          typeof MLGraphBuilder !== 'undefined' && typeof MLGraphBuilder.prototype.scatterND === 'function',
+        };
+        /* await all pending readbacks, write to the heap in enqueue order
+           (in-place chains alias one pointer - the last value must win) */
+        S.flush = async function() {
+            const pend = S.pending;
+            S.pending = [];
+            S.pendingPtrs = new Set();
+            const bufs = await Promise.all(pend.map(function(p) { return p.promise; }));
+            for (let i = 0; i < bufs.length; i++) {
+                HEAPU8.set(new Uint8Array(bufs[i]), pend[i].ptr);
+            }
         };
         S.f16 = function(h) {
             const s = (h & 0x8000) ? -1 : 1;
@@ -438,8 +453,9 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
                 }
                 ops.push(out);
             }
-            /* d.outs is [[node index, resident 0|1], ...]; resident outputs bind a
-               ping-pong partner of the persistent region tensor at dispatch time */
+            /* d.outs is [[node index, resident 0|1, chained 0|1], ...]; resident
+               outputs ping-pong the persistent region tensor; chained outputs
+               bind a pooled boundary tensor - both resolved at dispatch time */
             const outputsObj = {};
             for (const o of d.outs) {
                 let op = ops[o[0]];
@@ -453,8 +469,9 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
             const outInfo = [];
             for (const o of d.outs) {
                 const n = d.nodes[o[0]];
-                const info = { name : 'n' + o[0], resident : !!o[1], tensor : null };
-                if (!info.resident) {
+                const info = { name : 'n' + o[0], resident : !!o[1], chain : !!o[2],
+                               dt : n.dt, shape : n.shape, tensor : null };
+                if (!info.resident && !info.chain) {
                     info.tensor = await S.context.createTensor(
                         { dataType : n.dt, shape : n.shape, dimensions : n.shape, readable : true });
                 }
@@ -504,7 +521,7 @@ EM_JS(void, ggml_webnn_js_invalidate, (void * ptr, size_t size), {
     }
     const lo = Number(ptr);
     const hi = lo + Number(size);
-    for (const m of [S.tpool, S.resident]) {
+    for (const m of [S.tpool, S.resident, S.chained]) {
         for (const e of Array.from(m.entries())) {
             const rec = e[1];
             if (rec.p >= lo && rec.p < hi) {
@@ -534,9 +551,38 @@ EM_JS(void, ggml_webnn_js_invalidate, (void * ptr, size_t size), {
     }
 });
 
-// execute one compiled graph: upload changed inputs, dispatch, read all
-// outputs back into the wasm heap. in_tab is n_in x [ptr, nbytes, flags]
-// (flags bit0 = weight), out_tab is n_out x [ptr, nbytes]. returns 0 on success.
+// begin a graph_compute call: flush any leftovers and open a new chain epoch
+EM_ASYNC_JS(int, ggml_webnn_js_begin, (), {
+    const S = globalThis.__ggml_webnn;
+    try {
+        if (S.pending.length) {
+            await S.flush();
+        }
+        S.chainEpoch++;
+        return 0;
+    } catch (e) {
+        console.error('ggml-webnn: begin failed:', e);
+        return 1;
+    }
+});
+
+// await all enqueued readbacks and write them to host memory
+EM_ASYNC_JS(int, ggml_webnn_js_flush, (), {
+    const S = globalThis.__ggml_webnn;
+    try {
+        await S.flush();
+        return 0;
+    } catch (e) {
+        console.error('ggml-webnn: flush failed:', e);
+        return 1;
+    }
+});
+
+// ENQUEUE one compiled graph: upload changed inputs, dispatch (fire-and-forget)
+// and queue readbacks - they complete at the next flush. in_tab is n_in x
+// [ptr, nbytes, flags] (bit0 weight, bit1 resident, bit2 i64->i32, bit3 const);
+// out_tab is n_out x [ptr, nbytes, flags] (bit0 resident, bit1 readback,
+// bit2 chained: result stays on device for a later segment this epoch).
 EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
             (const char * desc, void * in_tab, int n_in, void * out_tab, int n_out), {
     const S = globalThis.__ggml_webnn;
@@ -552,6 +598,7 @@ EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
         if (!entry) {
             entry = await S.buildGraph(descStr, inT, n_in);
         }
+        const same = function(a, c) { return a.length === c.length && a.every(function(v, i) { return v === c[i]; }); };
 
         const feeds = {};
         for (let i = 0; i < n_in; i++) {
@@ -567,6 +614,17 @@ EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
                 const rec = await S.getResident(ptr, e.dt, e.shape, nb);
                 feeds['x' + i] = rec.cur;
                 continue;
+            }
+            /* produced on-device by an earlier segment this epoch? bind directly */
+            const ch = S.chained.get('c' + ptr);
+            if (ch && ch.epoch === S.chainEpoch && ch.dt === e.dt && same(ch.shape, e.shape)) {
+                feeds['x' + i] = ch.t;
+                continue;
+            }
+            /* the host copy is the source: if its readback is still in flight,
+               flush first so we do not upload stale data */
+            if (S.pendingPtrs.has(ptr)) {
+                await S.flush();
             }
             const key = ptr + '|' + entry.inKeys[i];
             let rec = S.tpool.get(key);
@@ -595,22 +653,37 @@ EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
             }
             feeds['x' + i] = rec.t;
         }
+        const inputTensors = new Set(Object.values(feeds));
 
-        /* outputs: resident regions ping-pong cur/alt (a dispatch cannot read and
-           write the same MLTensor); everything else uses per-graph tensors */
+        /* outputs: resident regions ping-pong cur/alt; chained results bind a
+           pooled tensor reused as a later segment's input; the rest use
+           per-graph tensors */
         const outFeeds = {};
         const swaps = [];
         for (let j = 0; j < n_out; j++) {
             const info = entry.outInfo[j];
+            const ptr = HEAPU32[outT + j*3];
             if (info.resident) {
                 /* the scatter graph always reads the region, so the record exists */
-                const rec = S.resident.get('r' + HEAPU32[outT + j*3]);
+                const rec = S.resident.get('r' + ptr);
                 if (!rec.alt) {
                     rec.alt = await S.context.createTensor(
                         { dataType : rec.dt, shape : rec.shape, dimensions : rec.shape, readable : true, writable : true });
                 }
                 outFeeds[info.name] = rec.alt;
                 swaps.push(rec);
+            } else if (info.chain) {
+                let rec = S.chained.get('c' + ptr);
+                const stale = !rec || rec.dt !== info.dt || !same(rec.shape, info.shape) ||
+                              inputTensors.has(rec.t); /* cannot read and write one tensor */
+                if (stale) {
+                    rec = { t : await S.context.createTensor(
+                                { dataType : info.dt, shape : info.shape, dimensions : info.shape, readable : true, writable : true }),
+                            dt : info.dt, shape : info.shape, p : ptr, epoch : 0 };
+                    S.chained.set('c' + ptr, rec);
+                }
+                rec.epoch = S.chainEpoch;
+                outFeeds[info.name] = rec.t;
             } else {
                 outFeeds[info.name] = info.tensor;
             }
@@ -624,24 +697,24 @@ EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
             rec.alt = t;
         }
 
-        /* read back host-materialized outputs; heap writes MUST happen in node
-           order - in-place chains alias one pointer and the last value wins */
-        const rIdx = [];
-        const rProm = [];
+        /* queue readbacks for host-materialized outputs; flushed in order later */
         for (let j = 0; j < n_out; j++) {
             const fl = HEAPU32[outT + j*3 + 2];
             if (!(fl & 2)) {
                 continue;
             }
             const info = entry.outInfo[j];
-            const t = info.resident ? S.resident.get('r' + HEAPU32[outT + j*3]).cur : info.tensor;
-            rIdx.push(j);
-            rProm.push(S.context.readTensor(t));
-        }
-        const bufs = await Promise.all(rProm);
-        for (let m = 0; m < rIdx.length; m++) {
-            /* HEAPU8/U32 are re-read after the awaits - memory may have grown */
-            HEAPU8.set(new Uint8Array(bufs[m]), HEAPU32[outT + rIdx[m]*3]);
+            const ptr = HEAPU32[outT + j*3];
+            let t;
+            if (info.resident) {
+                t = S.resident.get('r' + ptr).cur;
+            } else if (info.chain) {
+                t = S.chained.get('c' + ptr).t;
+            } else {
+                t = info.tensor;
+            }
+            S.pending.push({ promise : S.context.readTensor(t), ptr : ptr });
+            S.pendingPtrs.add(ptr);
         }
         return 0;
     } catch (e) {
@@ -978,10 +1051,12 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
 
     // 1a. partition into segments of at most GGML_WEBNN_CHUNK nodes, each
     // compiled and dispatched as its own graph. tensors consumed by a LATER
-    // segment must be materialized to host even when also consumed within
-    // their own segment (the per-segment sink rule cannot see that)
+    // segment are either chained device-side (when every cross-segment
+    // consumer reads the producer tensor directly, same shape/type) or
+    // materialized to host before the consumer uploads
     const size_t chunk_sz = g_webnn_chunk > 0 ? (size_t) g_webnn_chunk : all_nodes.size();
     std::vector<bool> cross_seg(all_nodes.size(), false);
+    std::vector<bool> chain_ok(all_nodes.size(), true);
     if (chunk_sz < all_nodes.size()) {
         std::map<const ggml_tensor *, size_t> global_idx;
         for (size_t i = 0; i < all_nodes.size(); i++) {
@@ -989,17 +1064,26 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
         }
         for (size_t i = 0; i < all_nodes.size(); i++) {
             for (int k = 0; k < GGML_MAX_SRC && all_nodes[i]->src[k]; k++) {
-                const ggml_tensor * s = all_nodes[i]->src[k];
+                const ggml_tensor * s0 = all_nodes[i]->src[k];
+                const ggml_tensor * s = s0;
                 while (global_idx.find(s) == global_idx.end() && s->view_src) {
                     s = s->view_src;
                 }
                 auto it = global_idx.find(s);
                 if (it != global_idx.end() && it->second / chunk_sz != i / chunk_sz) {
                     cross_seg[it->second] = true;
+                    if (s0 != s) {
+                        chain_ok[it->second] = false; // consumed through a view: shapes differ
+                    }
                 }
             }
         }
     }
+
+    if (ggml_webnn_js_begin() != 0) {
+        return GGML_STATUS_FAILED;
+    }
+
     for (size_t seg_base = 0; seg_base < all_nodes.size(); seg_base += chunk_sz) {
 
     const std::vector<ggml_tensor *> nodes(all_nodes.begin() + seg_base,
@@ -1295,20 +1379,22 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
             auto lit = last_scatter.find(node->data);
             is_res = lit != last_scatter.end() && lit->second == (int) i;
         }
-        bool readback = !consumed[i] || (node->flags & GGML_TENSOR_FLAG_OUTPUT) || cross_seg[seg_base + i];
+        const bool is_chain = !is_res && cross_seg[seg_base + i] && chain_ok[seg_base + i];
+        bool readback = !consumed[i] || (node->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                        (cross_seg[seg_base + i] && !is_chain);
         if (!g_webnn_prune && !is_res) {
             readback = true;
         }
-        if (!is_res && !readback) {
+        if (!is_res && !is_chain && !readback) {
             continue;
         }
         if (n_out > 0) {
             desc += ",";
         }
-        desc += "[" + std::to_string(i) + "," + (is_res ? "1" : "0") + "]";
+        desc += "[" + std::to_string(i) + "," + (is_res ? "1" : "0") + "," + (is_chain ? "1" : "0") + "]";
         out_tab.push_back((uint32_t) (uintptr_t) node->data);
         out_tab.push_back((uint32_t) (is_res ? g_webnn_resident[node->data] : ggml_nbytes(node)));
-        out_tab.push_back((is_res ? 1u : 0u) | (readback ? 2u : 0u));
+        out_tab.push_back((is_res ? 1u : 0u) | (readback ? 2u : 0u) | (is_chain ? 4u : 0u));
         n_out++;
     }
     desc += "],\"ext\":[";
@@ -1338,6 +1424,11 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
     }
 
     } // segment loop
+
+    // all segments are enqueued; one await completes every host readback
+    if (ggml_webnn_js_flush() != 0) {
+        return GGML_STATUS_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 
