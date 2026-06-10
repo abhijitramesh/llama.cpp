@@ -24,6 +24,12 @@ if (q.get('nosc')) {
 if (q.get('chunk')) {
     globalThis.GGML_WEBNN_CHUNK = Number(q.get('chunk'));
 }
+if (q.get('minb')) {
+    globalThis.GGML_WEBNN_MIN_BATCH = Number(q.get('minb'));
+}
+if (q.get('maxb')) {
+    globalThis.GGML_WEBNN_MAX_BATCH = Number(q.get('maxb'));
+}
 var Module = {
     arguments: (q.get('args') || '').split(' ').filter(function(s) { return s.length > 0; }),
     print: function(t) { console.log(t); },

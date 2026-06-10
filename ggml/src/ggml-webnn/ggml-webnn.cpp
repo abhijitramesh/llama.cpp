@@ -573,6 +573,15 @@ EM_JS(int, ggml_webnn_js_chunk, (), {
     return globalThis.GGML_WEBNN_CHUNK ? Number(globalThis.GGML_WEBNN_CHUNK) : 0;
 });
 
+// hybrid phase routing: only accept heavy ops whose token-batch size is in
+// [GGML_WEBNN_MIN_BATCH, GGML_WEBNN_MAX_BATCH] (0 = unbounded)
+EM_JS(int, ggml_webnn_js_min_batch, (), {
+    return globalThis.GGML_WEBNN_MIN_BATCH ? Number(globalThis.GGML_WEBNN_MIN_BATCH) : 0;
+});
+EM_JS(int, ggml_webnn_js_max_batch, (), {
+    return globalThis.GGML_WEBNN_MAX_BATCH ? Number(globalThis.GGML_WEBNN_MAX_BATCH) : 0;
+});
+
 // drop cached device tensors whose host region overlaps [ptr, ptr+size):
 // called when host memory is freed, cleared or overwritten
 EM_JS(void, ggml_webnn_js_invalidate, (void * ptr, size_t size), {
@@ -789,6 +798,8 @@ static bool   g_webnn_force_f16   = false;
 static bool   g_webnn_has_scatter = false;
 static bool   g_webnn_prune       = false; // skip host writeback of consumed intermediates
 static int    g_webnn_chunk       = 0;     // max nodes per compiled graph (0 = whole split)
+static int    g_webnn_min_batch   = 0;     // hybrid routing: heavy-op token-batch window
+static int    g_webnn_max_batch   = 0;
 static size_t g_webnn_n_ops       = 0; // ggml nodes executed via WebNN
 static size_t g_webnn_n_dispatch  = 0; // compiled-graph dispatches
 static std::map<std::string, size_t> g_webnn_op_tally;  // per-op execution counts
@@ -1748,6 +1759,18 @@ static bool ggml_webnn_all_float_contig(const ggml_tensor * op) {
     return true;
 }
 
+// hybrid phase routing: heavy ops outside the configured token-batch window
+// are declined so the scheduler places them on another backend (e.g. WebGPU)
+static bool ggml_webnn_batch_ok(int64_t batch) {
+    if (g_webnn_min_batch > 0 && batch < g_webnn_min_batch) {
+        return false;
+    }
+    if (g_webnn_max_batch > 0 && batch > g_webnn_max_batch) {
+        return false;
+    }
+    return true;
+}
+
 static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -1780,6 +1803,9 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_MUL_MAT:
         {
+            if (!ggml_webnn_batch_ok(src1->ne[1])) {
+                return false;
+            }
             // f32/f16 srcs in any combination (strided views allowed), f32 dst
             if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
                 return false;
@@ -1826,6 +1852,9 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_FLASH_ATTN_EXT:
         {
+            if (!ggml_webnn_batch_ok(src0->ne[1])) {
+                return false;
+            }
             const ggml_tensor * v    = op->src[2];
             const ggml_tensor * mask = op->src[3];
             if (op->src[4] != nullptr) {
@@ -2063,6 +2092,12 @@ ggml_backend_reg_t ggml_backend_webnn_reg(void) {
             g_webnn_chunk = ggml_webnn_js_chunk();
             if (g_webnn_chunk > 0) {
                 GGML_LOG_INFO("ggml-webnn: compiling graphs in chunks of %d nodes (GGML_WEBNN_CHUNK)\n", g_webnn_chunk);
+            }
+            g_webnn_min_batch = ggml_webnn_js_min_batch();
+            g_webnn_max_batch = ggml_webnn_js_max_batch();
+            if (g_webnn_min_batch > 0 || g_webnn_max_batch > 0) {
+                GGML_LOG_INFO("ggml-webnn: heavy ops restricted to token batch [%d, %d]\n",
+                              g_webnn_min_batch, g_webnn_max_batch ? g_webnn_max_batch : 999999);
             }
         } else {
             GGML_LOG_WARN("ggml-webnn: navigator.ml is not available, WebNN backend disabled\n");
