@@ -200,6 +200,9 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
                     {
                         const x = srcOp(n, 0, null);
                         out = srcDt(n, 0) !== n.dt ? b.cast(x, n.dt) : b.identity(x);
+                        if (!same(n.ss[0], n.shape)) {
+                            out = b.reshape(out, n.shape); /* CPY may change the logical shape */
+                        }
                         break;
                     }
                     default:
@@ -292,7 +295,7 @@ EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
         }
         return 0;
     } catch (e) {
-        console.error('ggml-webnn: graph dispatch failed:', e);
+        console.error('ggml-webnn: graph dispatch failed:', e, UTF8ToString(Number(desc)).slice(0, 4000));
         return 1;
     }
 });

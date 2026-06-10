@@ -325,6 +325,14 @@ int main() {
         { "dup", NMSE_DEFAULT, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
             return ggml_dup(ctx, new_input(ctx, "a", in, 64, 5, 4, 3));
         }},
+        { "cpy_reshape_matmul", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // shape-changing copy feeding a matmul (the attention heads-merge pattern):
+            // cont([48,6] view) -> [288] -> wo @ x
+            ggml_tensor * x  = new_input(ctx, "x",  in, 48, 6);
+            ggml_tensor * w  = new_input(ctx, "w",  in, 288, 32);
+            ggml_tensor * merged = ggml_cpy(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 288, 1));
+            return ggml_mul_mat(ctx, w, merged);
+        }},
         { "rms_norm", NMSE_COMPOSED, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
             return ggml_rms_norm(ctx, new_input(ctx, "a", in, 128, 4, 2, 1), 1e-6f);
         }},
