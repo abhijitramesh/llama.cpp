@@ -20,12 +20,16 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 WEBNN_FLAGS="--enable-features=WebMachineLearningNeuralNetwork,WebNNCoreML,WebNNCoreMLExplicitGPUOrNPU"
 
-cleanup() { pkill -f "http.server 910" 2>/dev/null; [ -n "${CHROME_PID:-}" ] && kill "$CHROME_PID" 2>/dev/null; }
+cleanup() {
+    { pkill -f "http.server 910"; [ -n "${CHROME_PID:-}" ] && kill "$CHROME_PID"; wait; } 2>/dev/null
+}
 trap cleanup EXIT
 
 serve() { # dir port
-    (cd "$1" && python3 -m http.server "$2" >/dev/null 2>&1) &
-    disown
+    # nohup + disown detaches the server from job control so killing it at
+    # exit stays silent (macOS has no setsid)
+    nohup python3 -m http.server "$2" --directory "$1" >/dev/null 2>&1 < /dev/null &
+    disown 2>/dev/null
     sleep 1
 }
 
