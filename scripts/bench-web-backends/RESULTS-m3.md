@@ -1,5 +1,14 @@
 # WebGPU vs WebNN benchmark — Apple M3 MacBook, Chrome 149 (headless)
 
+> **Delegate relabeling (verified via --webnn-coreml-dump-model logging):**
+> the plain `--enable-features=WebMachineLearningNeuralNetwork` flag uses the
+> **CoreML backend with MLComputeUnitsAll** on this machine (kWebNNCoreML is
+> default-ON for Apple Silicon). Rows previously labeled "LiteRT" are
+> CoreML-All; rows labeled "CoreML npu" are CoreML with explicit
+> CPUAndNeuralEngine units. All cross-delegate attributions (compile
+> behavior, scatter slowness, the maskless-GQA zeros bug) are differences
+> between CoreML compute-unit modes, not different delegates.
+
 ## Pure-WebNN steady state with quantized weights (commit 364727ce7)
 
 SmolLM2-135M, llama-bench -p 128 -n 64 -r 2 -fa 1 (warmup amortizes
