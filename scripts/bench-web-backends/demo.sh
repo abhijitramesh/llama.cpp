@@ -134,8 +134,8 @@ webgpu)
     serve "$ROOT/build-webgpu/bin" 9101
     power_start
     T0=$(date +%s)
-    chrome_bench "" 9101 "model=smollm2-135m-q4_0.gguf&args=-m%20/smollm2-135m-q4_0.gguf%20-p%20128,1024%20-n%20256%20-r%204%20-ngl%2099" "$LOG"
-    echo ">>> WebGPU: loading model, then SHORT PREFILL pp128 (WebNN wins this one)..."
+    chrome_bench "" 9101 "model=stories15M-q4_0.gguf&args=-m%20/stories15M-q4_0.gguf%20-p%20128,1024%20-n%20256%20-r%204%20-ngl%2099" "$LOG"
+    echo ">>> WebGPU: loading, then SHORT PREFILL pp128 (WebNN wins this length)..."
     wait_for "pp128 " "$LOG"; T_PP1=$WAIT_TS
     echo ">>> LONG PREFILL pp1024 running (WebGPU wins this one - watch GPU)..."
     wait_for "pp1024" "$LOG"; T_PP=$WAIT_TS
@@ -167,8 +167,8 @@ webnn-q4)
     serve "$ROOT/build-webnn/bin" 9102
     power_start
     T0=$(date +%s)
-    chrome_bench "$WEBNN_FLAGS" 9102 "model=smollm2-135m-q4_0.gguf&webnn=npu&chunk=24&prune=1&args=-m%20/smollm2-135m-q4_0.gguf%20-p%20128,1024%20-n%20256%20-r%204%20-fa%201%20-ngl%2099" "$LOG"
-    echo ">>> WebNN q4: compile, then SHORT PREFILL pp128 (the ~1950 t/s record, beats WebGPU)..."
+    chrome_bench "$WEBNN_FLAGS" 9102 "model=stories15M-q4_0.gguf&webnn=npu&chunk=24&prune=1&args=-m%20/stories15M-q4_0.gguf%20-p%20128,1024%20-n%20256%20-r%204%20-fa%201%20-ngl%2099" "$LOG"
+    echo ">>> WebNN q4: compile, then SHORT PREFILL pp128 (WebNN beats WebGPU here)..."
     wait_for "pp128 " "$LOG"; T_PP1=$WAIT_TS
     echo ">>> LONG PREFILL pp1024 running (WebGPU scales better here - honest crossover)..."
     wait_for "pp1024" "$LOG"; T_PP=$WAIT_TS

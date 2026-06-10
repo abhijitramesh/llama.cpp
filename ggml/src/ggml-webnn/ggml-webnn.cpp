@@ -227,10 +227,19 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
         S.getResident = async function(ptr, dt, shape, nbytes) {
             const key = 'r' + ptr;
             let rec = S.resident.get(key);
+            if (rec && rec.nb !== nbytes) {
+                /* the host region was reallocated at the same pointer with a
+                   different size (e.g. a new llama context): drop the stale
+                   device tensor */
+                if (rec.cur) { rec.cur.destroy(); }
+                if (rec.alt) { rec.alt.destroy(); }
+                S.resident.delete(key);
+                rec = null;
+            }
             if (!rec) {
                 rec = {
                     cur : await S.context.createTensor({ dataType : dt, shape : shape, dimensions : shape, readable : true, writable : true }),
-                    alt : null, dt : dt, shape : shape, p : ptr,
+                    alt : null, dt : dt, shape : shape, p : ptr, nb : nbytes,
                 };
                 S.context.writeTensor(rec.cur, HEAPU8.subarray(ptr, ptr + nbytes));
                 S.resident.set(key, rec);
