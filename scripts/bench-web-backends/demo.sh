@@ -12,16 +12,19 @@
 #   mactop
 #
 # Prefill/decode are separate llama-bench tests: the pp row prints when the
-# prefill phase ends, the tg row when decode ends - point at the row and the
-# matching power spike together.
+# prefill phase ends, the tg row when decode ends. The workload modes also
+# sample powermetrics themselves (sudo, optional) and print per-phase
+# peak/average power for CPU/GPU/ANE after the rows.
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 WEBNN_FLAGS="--enable-features=WebMachineLearningNeuralNetwork,WebNNCoreML,WebNNCoreMLExplicitGPUOrNPU"
+PWRLOG=""
 
 cleanup() {
-    { pkill -f "http.server 910"; [ -n "${CHROME_PID:-}" ] && kill "$CHROME_PID"; wait; } 2>/dev/null
+    { pkill -f "http.server 910"; pkill -f "powermetrics.*-i 500";
+      [ -n "${CHROME_PID:-}" ] && kill "$CHROME_PID"; wait; } 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -43,15 +46,53 @@ chrome_bench() { # flags port query log
     CHROME_PID=$!
 }
 
-wait_for() { # pattern log
+wait_for() { # pattern log -> sets WAIT_TS (epoch seconds when the row appeared)
     until grep -q "$1" "$2"; do
         sleep 1
         kill -0 "$CHROME_PID" 2>/dev/null || { echo "!!! chrome exited early, see $2"; exit 1; }
     done
+    WAIT_TS=$(date +%s)
 }
 
 show_rows() { # log
     grep -E "\| *(pp|tg)[0-9]+" "$1" | sed -E 's/.*CONSOLE:?[0-9()]*\] //; s/", source.*//; s/^"//'
+}
+
+# --- per-phase power attribution -------------------------------------------
+# powermetrics samples (0.5 s) are logged with epoch timestamps; each phase
+# window is reconstructed backwards from the moment its result row printed,
+# using the measured t/s and the known token count (x1.15 + 1 s margin).
+
+power_start() {
+    sudo -v 2>/dev/null || sudo -v || { echo "(no sudo - per-phase power disabled)"; return 0; }
+    PWRLOG=$(mktemp /tmp/demo-pwr.XXXXXX)
+    # -i 500 also makes these samplers distinguishable from a concurrently
+    # running './demo.sh power' dashboard (-i 1000) at cleanup time
+    sudo -n powermetrics --samplers cpu_power,gpu_power,ane_power -i 500 2>/dev/null | awk '
+        /^CPU Power:/ { c = $3 }
+        /^GPU Power:/ { g = $3 }
+        /^ANE Power:/ { cmd = "date +%s"; cmd | getline t; close(cmd); print t, c, g, $3; fflush() }
+    ' >"$PWRLOG" &
+    disown 2>/dev/null
+}
+
+phase_power() { # label row-pattern n-tokens log t_end t_floor
+    [ -n "$PWRLOG" ] && [ -s "$PWRLOG" ] || return 0
+    local speed dur start
+    speed=$(grep -E "\| *$2" "$4" | sed -E 's/.*\|[^0-9]*([0-9.]+) ±.*/\1/' | head -1)
+    [ -n "$speed" ] || return 0
+    dur=$(awk -v n="$3" -v s="$speed" 'BEGIN { printf "%d", n / s * 1.15 + 1 }')
+    start=$(( $5 - dur ))
+    [ "$start" -lt "$6" ] && start=$6
+    awk -v s="$start" -v e="$5" -v lbl="$1" '
+        $1 >= s && $1 <= e {
+            if ($2 > pc) pc = $2; if ($3 > pg) pg = $3; if ($4 > pa) pa = $4;
+            sc += $2; sg += $3; sa += $4; n++;
+        }
+        END {
+            if (n) printf ">>> %-7s peak: CPU %5.2f W  GPU %5.2f W  ANE %4.0f mW    (avg %.2f / %.2f W / %.0f mW over ~%ds)\n",
+                lbl, pc/1000, pg/1000, pa, sc/n/1000, sg/n/1000, sa/n, e - s;
+        }' "$PWRLOG"
 }
 
 case "${1:-}" in
@@ -91,50 +132,67 @@ power)
 webgpu)
     LOG=/tmp/demo-webgpu.log
     serve "$ROOT/build-webgpu/bin" 9101
+    power_start
+    T0=$(date +%s)
     chrome_bench "" 9101 "model=smollm2-135m-q4_0.gguf&args=-m%20/smollm2-135m-q4_0.gguf%20-p%201024%20-n%20256%20-r%204%20-ngl%2099" "$LOG"
     echo ">>> WebGPU: loading model, then PREFILL (watch GPU power)..."
-    wait_for "pp1024" "$LOG"
+    wait_for "pp1024" "$LOG"; T_PP=$WAIT_TS
     echo ">>> PREFILL DONE -- DECODE running (watch GPU)"
-    wait_for "tg256" "$LOG"
+    wait_for "tg256" "$LOG"; T_TG=$WAIT_TS
     show_rows "$LOG"
+    phase_power "PREFILL" "pp1024" $((1024 * 5)) "$LOG" "$T_PP" "$T0"
+    phase_power "DECODE"  "tg256"  $((256 * 5))  "$LOG" "$T_TG" "$T_PP"
     ;;
 webnn)
     LOG=/tmp/demo-webnn.log
     serve "$ROOT/build-webnn/bin" 9102
+    power_start
+    T0=$(date +%s)
     chrome_bench "$WEBNN_FLAGS" 9102 "model=smollm2-135m-f16.gguf&webnn=npu&f16=1&chunk=24&prune=1&args=-m%20/smollm2-135m-f16.gguf%20-p%201024%20-n%20128%20-r%202%20-fa%201%20-ngl%2099" "$LOG"
     echo ">>> WebNN/ANE: CoreML compiling (~30-60s), then PREFILL (ANE engages)..."
-    wait_for "pp1024" "$LOG"
+    wait_for "pp1024" "$LOG"; T_PP=$WAIT_TS
     echo ">>> PREFILL DONE -- DECODE running (~30s of sustained ANE power, watch mactop)"
-    wait_for "tg128" "$LOG"
+    wait_for "tg128" "$LOG"; T_TG=$WAIT_TS
     show_rows "$LOG"
+    phase_power "PREFILL" "pp1024" $((1024 * 3)) "$LOG" "$T_PP" "$T0"
+    phase_power "DECODE"  "tg128"  $((128 * 3))  "$LOG" "$T_TG" "$T_PP"
     ;;
 webnn-q4)
     LOG=/tmp/demo-webnn-q4.log
     serve "$ROOT/build-webnn/bin" 9102
+    power_start
+    T0=$(date +%s)
     chrome_bench "$WEBNN_FLAGS" 9102 "model=smollm2-135m-q4_0.gguf&webnn=npu&chunk=24&prune=1&args=-m%20/smollm2-135m-q4_0.gguf%20-p%201024%20-n%20256%20-r%204%20-fa%201%20-ngl%2099" "$LOG"
     echo ">>> WebNN q4 (prefill record ~1950 t/s; int4 runs on CPU/GPU units, ANE stays 0)"
-    wait_for "pp1024" "$LOG"
+    wait_for "pp1024" "$LOG"; T_PP=$WAIT_TS
     echo ">>> PREFILL DONE -- DECODE running"
-    wait_for "tg256" "$LOG"
+    wait_for "tg256" "$LOG"; T_TG=$WAIT_TS
     show_rows "$LOG"
+    phase_power "PREFILL" "pp1024" $((1024 * 5)) "$LOG" "$T_PP" "$T0"
+    phase_power "DECODE"  "tg256"  $((256 * 5))  "$LOG" "$T_TG" "$T_PP"
     ;;
 hybrid)
     L1=/tmp/demo-hybrid-prefill.log
     L2=/tmp/demo-hybrid-decode.log
     serve "$ROOT/build-webnn/bin" 9102
     serve "$ROOT/build-webgpu/bin" 9101
+    power_start
+    T0=$(date +%s)
     echo ">>> HYBRID PHASE 1: PREFILL on WebNN/NPU (compile ~30-60s, then ANE spike)"
     chrome_bench "$WEBNN_FLAGS" 9102 "model=smollm2-135m-f16.gguf&webnn=npu&f16=1&chunk=24&prune=1&args=-m%20/smollm2-135m-f16.gguf%20-p%201024%20-n%200%20-r%203%20-fa%201%20-ngl%2099" "$L1"
-    wait_for "pp1024" "$L1"
+    wait_for "pp1024" "$L1"; T_PP=$WAIT_TS
     kill "$CHROME_PID" 2>/dev/null
     show_rows "$L1"
+    phase_power "PREFILL" "pp1024" $((1024 * 4)) "$L1" "$T_PP" "$T0"
     echo ">>> KV HANDOVER (~1.7 MB, ~ms) ... PHASE 2: DECODE on WebGPU (ANE drops, GPU spikes)"
+    T1=$(date +%s)
     chrome_bench "" 9101 "model=smollm2-135m-f16.gguf&args=-m%20/smollm2-135m-f16.gguf%20-p%200%20-n%20256%20-r%203%20-ngl%2099" "$L2"
-    wait_for "tg256" "$L2"
+    wait_for "tg256" "$L2"; T_TG=$WAIT_TS
     show_rows "$L2"
+    phase_power "DECODE" "tg256" $((256 * 4)) "$L2" "$T_TG" "$T1"
     ;;
 *)
-    sed -n '2,16p' "$0"
+    sed -n '2,18p' "$0"
     exit 1
     ;;
 esac
