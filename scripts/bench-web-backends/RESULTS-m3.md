@@ -1,5 +1,55 @@
 # WebGPU vs WebNN benchmark — Apple M3 MacBook, Chrome 149 (headless)
 
+## v3 backend: attention on WebNN (commit cdc355ab6)
+
+ROPE, FLASH_ATTN_EXT and strided (permuted-dense) views now translate
+into the compiled MLGraphs, so whole transformer layers run on WebNN.
+Graph splits dropped 27 -> 13 at decode (only the KV-cache SET_ROWS
+writes remain on CPU). llama's flash-attn auto-detection resolves to
+the non-FA path on this backend; `-fa 1` (composed flash-attn) is
+slightly faster still (15M: pp 5619).
+
+stories15M (f32 model except f16 rows):
+
+| config        | pp128 t/s | tg64 t/s | CPU mW | GPU mW | ANE mW        |
+|---------------|-----------|----------|--------|--------|---------------|
+| cpu           | 1061      | 540      | 7250   | 100    | 0             |
+| webnn-default | 4747      | 110      | 7725   | 122    | 0             |
+| webnn-npu-f16 | 4595      | 66       | 8918   | 65     | **351 (pk 875)** |
+| webgpu        | 8767      | 264      | 7450   | 179    | 0             |
+| webgpu-f16    | 8713      | 329      | 7689   | 214    | 0             |
+
+stories110M:
+
+| config        | pp128 t/s | tg64 t/s | CPU mW | GPU mW | ANE mW        |
+|---------------|-----------|----------|--------|--------|---------------|
+| cpu (f32)     | 120       | 77       | 9115   | 105    | 0             |
+| cpu-f16       | 24        | 18       | 9304   | 105    | 0             |
+| webnn-default | 934       | 18       | 9794   | 81     | 0             |
+| webnn-npu-f16 | **1007**  | 18       | 9032   | 115    | **507 (pk 788)** |
+| webgpu        | 2866      | 112      | 6363   | 1031   | 0             |
+| webgpu-f16    | 2826      | 185      | 6538   | 828    | 0             |
+
+v3 findings:
+
+1. **Prefill gap to WebGPU halved again**: 15M 4747 vs 8767 (54%, was
+   26% in v2, 13% in v1); 110M 934-1007 vs ~2850 (~35%, was 14%).
+   Versus wasm CPU the 110M prefill advantage is 8x (f32) / 42x (f16).
+2. **The ANE now runs the whole attention stack**: webnn-npu-f16 at
+   110M sustains 507 mW ANE across the run (peak 788) and is the
+   fastest WebNN configuration at that size - the first time the
+   NPU path wins outright over LiteRT-CPU.
+3. **Decode is unchanged (~110 / ~18 t/s)** and is now cleanly
+   attributable: 13 graph splits per token (KV SET_ROWS on CPU between
+   every layer) plus the materialize-everything host writeback. The
+   next levers are exactly the planned v4 items: SET_ROWS/scatter in
+   graph, device-resident MLTensors, and output pruning.
+4. WebGPU remains ahead on every throughput and energy metric
+   (110M prefill ~2.3 vs ~9.4 mJ/token), but the heterogeneous endgame
+   (ANE matmuls + GPU attention) is now architecturally within reach:
+   both backends compile whole subgraphs and the scheduler can split
+   between them.
+
 ## v2 backend: whole-graph compilation + f16 (commit cf6725047 + 36de1d7dc)
 
 Same protocol as v1 below. f16 rows use `stories15M-f16.gguf` (converted
