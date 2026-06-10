@@ -1,5 +1,9 @@
 # WebGPU vs WebNN benchmark — Apple M3 MacBook, Chrome 149 (headless)
 
+> **The final three-way comparison (WebGPU vs WebNN vs hybrid, with energy)
+> lives in [FINAL-COMPARISON.md](FINAL-COMPARISON.md).** This file is the
+> historical experiment log (v1 → v5).
+
 > **Delegate relabeling (verified via --webnn-coreml-dump-model logging):**
 > the plain `--enable-features=WebMachineLearningNeuralNetwork` flag uses the
 > **CoreML backend with MLComputeUnitsAll** on this machine (kWebNNCoreML is
