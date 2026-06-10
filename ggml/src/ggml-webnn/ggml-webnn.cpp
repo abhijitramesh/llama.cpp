@@ -241,7 +241,8 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
                     cur : await S.context.createTensor({ dataType : dt, shape : shape, dimensions : shape, readable : true, writable : true }),
                     alt : null, dt : dt, shape : shape, p : ptr, nb : nbytes,
                 };
-                S.context.writeTensor(rec.cur, HEAPU8.subarray(ptr, ptr + nbytes));
+                const v0 = HEAPU8.subarray(ptr, ptr + nbytes);
+                S.context.writeTensor(rec.cur, ptr > 0x7fffffff ? v0.slice() : v0);
                 S.resident.set(key, rec);
             }
             return rec;
@@ -598,8 +599,8 @@ EM_JS(void, ggml_webnn_js_invalidate, (void * ptr, size_t size), {
     if (!S) {
         return;
     }
-    const lo = Number(ptr);
-    const hi = lo + Number(size);
+    const lo = Number(ptr) >>> 0;
+    const hi = lo + (Number(size) >>> 0);
     for (const m of [S.tpool, S.resident, S.chained]) {
         for (const e of Array.from(m.entries())) {
             const rec = e[1];
@@ -667,9 +668,9 @@ EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
     const S = globalThis.__ggml_webnn;
     try {
         /* under JSPI the wasm ABI passes these as BigInt - coerce before use */
-        const descStr = UTF8ToString(Number(desc));
-        const inT = Number(in_tab) >> 2;
-        const outT = Number(out_tab) >> 2;
+        const descStr = UTF8ToString(Number(desc) >>> 0);
+        const inT = (Number(in_tab) >>> 0) >>> 2;
+        const outT = (Number(out_tab) >>> 0) >>> 2;
         n_in = Number(n_in);
         n_out = Number(n_out);
 
@@ -725,8 +726,11 @@ EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
                     }
                     S.context.writeTensor(rec.t, conv);
                 } else {
-                    /* writeTensor copies synchronously, so a heap view is safe here */
-                    S.context.writeTensor(rec.t, HEAPU8.subarray(ptr, ptr + nb));
+                    /* writeTensor copies synchronously, so a heap view is safe
+                       here - but views with byteOffset beyond 2^31 are
+                       unreliable through the binding layer, so copy those */
+                    const v = HEAPU8.subarray(ptr, ptr + nb);
+                    S.context.writeTensor(rec.t, ptr > 0x7fffffff ? v.slice() : v);
                 }
                 rec.written = true;
             }

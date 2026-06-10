@@ -45,6 +45,7 @@ if (EMSCRIPTEN)
       add_link_options("-sMEMORY64=1")
     endif()
     add_link_options("-sALLOW_MEMORY_GROWTH=1")
+    add_link_options("-sMAXIMUM_MEMORY=4GB")
 
     option(LLAMA_WASM_SINGLE_FILE "llama: embed WASM inside the generated llama.js" OFF)
     option(LLAMA_BUILD_HTML "llama: build HTML file" ON)

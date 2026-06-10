@@ -39,14 +39,33 @@ var Module = {
         const model = q.get('model');
         if (!model) return;
         addRunDependency('fetch-model');
-        fetch(model)
-            .then(function(r) { if (!r.ok) throw new Error('model fetch failed: ' + r.status); return r.arrayBuffer(); })
-            .then(function(buf) {
-                FS.writeFile('/' + model, new Uint8Array(buf));
-                console.log('BENCH_MODEL_STAGED: ' + buf.byteLength);
+        /* comma-separated list supported (gguf shards: MEMFS cannot hold one
+           >2GB file, so big models are staged as splits); each file streams
+           in chunks rather than via one ArrayBuffer */
+        (async function() {
+            try {
+                let total = 0;
+                for (const name of model.split(',')) {
+                    const r = await fetch(name);
+                    if (!r.ok) throw new Error('model fetch failed: ' + r.status + ' ' + name);
+                    const f = FS.open('/' + name, 'w');
+                    const reader = r.body.getReader();
+                    let pos = 0;
+                    for (;;) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        FS.write(f, value, 0, value.length, pos);
+                        pos += value.length;
+                    }
+                    FS.close(f);
+                    total += pos;
+                }
+                console.log('BENCH_MODEL_STAGED: ' + total);
                 removeRunDependency('fetch-model');
-            })
-            .catch(function(e) { console.error('BENCH_MODEL_FETCH_FAILED', e); });
+            } catch (e) {
+                console.error('BENCH_MODEL_FETCH_FAILED', e);
+            }
+        })();
     }],
 };
 const s = document.createElement('script');
