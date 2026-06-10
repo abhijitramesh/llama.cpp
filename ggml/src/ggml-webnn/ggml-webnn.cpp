@@ -114,6 +114,67 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
             const n = shape[0], k = shape[1], nb = k / 32;
             const key = ptr + '|' + q + '|' + n + 'x' + k;
             let rec = S.qcache.get(key);
+            if (q === 'q4_k') {
+                /* super-blocks of 256: 2 f16 (d, dmin), 12 bytes of 6-bit
+                   scales/mins for 8 sub-blocks, 128 bytes of 4-bit q.
+                   value = (d*sc)*q - (dmin*m) per 32-value sub-block */
+                if (!rec) {
+                    const raw = HEAPU8.subarray(ptr, ptr + nbytes);
+                    const nsb = k / 256;
+                    const packed = new Uint8Array(n * k / 2);
+                    const scales = new Float32Array(n * nb);
+                    const mins = new Float32Array(n * nb);
+                    const vals = new Uint8Array(256);
+                    for (let r = 0; r < n; r++) {
+                        for (let sb = 0; sb < nsb; sb++) {
+                            const off = (r * nsb + sb) * 144;
+                            const d = S.f16(raw[off] | (raw[off + 1] << 8));
+                            const dmin = S.f16(raw[off + 2] | (raw[off + 3] << 8));
+                            const sc = off + 4; /* 12 bytes of packed 6-bit scales/mins */
+                            const subBase = r * nb + sb * 8;
+                            for (let j = 0; j < 8; j++) {
+                                let scv, mv;
+                                if (j < 4) {
+                                    scv = raw[sc + j] & 63;
+                                    mv = raw[sc + j + 4] & 63;
+                                } else {
+                                    scv = (raw[sc + j + 4] & 0xF) | ((raw[sc + j - 4] >> 6) << 4);
+                                    mv = (raw[sc + j + 4] >> 4) | ((raw[sc + j] >> 6) << 4);
+                                }
+                                scales[subBase + j] = d * scv;
+                                mins[subBase + j] = dmin * mv;
+                            }
+                            /* per 64 values: 32 q-bytes; low nibbles -> first 32,
+                               high nibbles -> next 32 */
+                            const qs = off + 16;
+                            for (let pair = 0; pair < 4; pair++) {
+                                const qb = qs + 32 * pair;
+                                const vb = 64 * pair;
+                                for (let l = 0; l < 32; l++) {
+                                    vals[vb + l] = raw[qb + l] & 0xF;
+                                    vals[vb + 32 + l] = raw[qb + l] >> 4;
+                                }
+                            }
+                            const base = (r * k + sb * 256) >> 1;
+                            for (let m2 = 0; m2 < 128; m2++) {
+                                packed[base + m2] = vals[2 * m2] | (vals[2 * m2 + 1] << 4);
+                            }
+                        }
+                    }
+                    rec = { wdt : 'uint4', w : packed, scales : scales, mins : mins,
+                            zp8 : false, p : ptr, pe : ptr + nbytes };
+                    S.qcache.set(key, rec);
+                }
+                const wq = b.constant({ dataType : 'uint4', shape : [n, k], dimensions : [n, k] }, rec.w.slice());
+                const sc = b.constant({ dataType : 'float32', shape : [n, nb], dimensions : [n, nb] }, rec.scales.slice());
+                const zp = b.constant({ dataType : 'uint4', shape : [n, nb], dimensions : [n, nb] },
+                                      new Uint8Array((n * nb + 1) >> 1));
+                let out = b.dequantizeLinear(wq, sc, zp);
+                const mn = b.constant({ dataType : 'float32', shape : [n, nb, 1], dimensions : [n, nb, 1] }, rec.mins.slice());
+                out = b.reshape(out, [n, nb, 32]);
+                out = b.sub(out, mn);
+                return b.reshape(out, [n, k]);
+            }
             if (!rec) {
                 const raw = HEAPU8.subarray(ptr, ptr + nbytes);
                 const scales = new Float32Array(n * nb);
@@ -748,13 +809,16 @@ static const char * ggml_webnn_dt(ggml_type t) {
 
 // quantized weight types translated to dequantizeLinear graph constants
 static bool ggml_webnn_is_quant(ggml_type t) {
-    return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q8_0;
+    return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K;
 }
 
 // quantized tensors must be immutable 2D weights with whole blocks per row
 static bool ggml_webnn_quant_ok(const ggml_tensor * t) {
-    return ggml_webnn_is_quant(t->type) && ggml_is_contiguous(t) &&
-           t->ne[1] > 0 && t->ne[2] == 1 && t->ne[3] == 1 && t->ne[0] % 32 == 0;
+    if (!ggml_webnn_is_quant(t->type) || !ggml_is_contiguous(t) ||
+        t->ne[1] <= 0 || t->ne[2] != 1 || t->ne[3] != 1) {
+        return false;
+    }
+    return t->ne[0] % (t->type == GGML_TYPE_Q4_K ? 256 : 32) == 0;
 }
 
 // JS (row-major) shape of a ggml tensor: reversed ne, e.g. rank 4 -> [ne3,ne2,ne1,ne0]
@@ -1228,7 +1292,8 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
             if (!ggml_webnn_quant_ok(t)) {
                 return false;
             }
-            const char * qn = t->type == GGML_TYPE_Q4_0 ? "q4_0" : "q8_0";
+            const char * qn = t->type == GGML_TYPE_Q4_0 ? "q4_0" :
+                              t->type == GGML_TYPE_Q4_K ? "q4_k" : "q8_0";
             const std::string shape = "[" + std::to_string(t->ne[1]) + "," + std::to_string(t->ne[0]) + "]";
             char key[64];
             snprintf(key, sizeof(key), "%p|%s|", t->data, qn);

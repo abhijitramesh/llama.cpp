@@ -70,7 +70,7 @@ static void fill_tensor(ggml_tensor * t, uint32_t seed) {
         ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(int64_t));
         return;
     }
-    if (t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q8_0) {
+    if (t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_K) {
         // quantize deterministic f32 data row by row
         uint32_t state = seed;
         std::vector<float> src(n);
@@ -506,6 +506,15 @@ int main() {
             ggml_tensor * w1 = new_input(ctx, "w1", in, 576, 1536, 1, 1, GGML_TYPE_Q4_0);
             ggml_tensor * w2 = new_input(ctx, "w2", in, 1536, 576, 1, 1, GGML_TYPE_Q4_0);
             return ggml_mul_mat(ctx, w2, ggml_mul_mat(ctx, w1, x));
+        }},
+        { "mul_mat_q4_k", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // K-quant super-blocks (256 values, two-level scales + mins)
+            return ggml_mul_mat(ctx, new_input(ctx, "w", in, 256, 32, 1, 1, GGML_TYPE_Q4_K),
+                                     new_input(ctx, "x", in, 256, 16));
+        }},
+        { "mul_mat_q4_k_512", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            return ggml_mul_mat(ctx, new_input(ctx, "w", in, 512, 64, 1, 1, GGML_TYPE_Q4_K),
+                                     new_input(ctx, "x", in, 512, 5));
         }},
         { "get_rows_q4_0", NMSE_DEFAULT, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
             ggml_tensor * src = new_input(ctx, "a", in, 64, 16, 1, 1, GGML_TYPE_Q4_0);
