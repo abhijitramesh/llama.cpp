@@ -52,25 +52,37 @@ show_rows() { # log
 
 case "${1:-}" in
 power)
-    # one line per second: timestamp + watts + bars (CPU 12 W / GPU 4 W /
-    # ANE 1 W full scale). ANE > 0 is the money shot for the WebNN demo.
-    exec sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 1000 2>/dev/null | awk '
-        function bar(mw, full,   n, i, s) {
-            n = int(mw * 24 / full); if (n > 24) n = 24;
-            s = "";
-            for (i = 0; i < n; i++) s = s "#";
-            return sprintf("%-24s", s);
+    # animated in-place dashboard (mactop-style): redraw each sample, with
+    # per-device bars (CPU 12 W / GPU 4 W / ANE 1 W full scale) and peaks.
+    # ANE > 0 is the money shot for the WebNN demo.
+    trap 'printf "\033[?25h\033[0m\n"' INT TERM
+    sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 1000 2>/dev/null | awk '
+        function bar(mw, full, color,   n, i, s) {
+            n = int(mw * 30 / full); if (n > 30) n = 30;
+            s = color;
+            for (i = 0; i < n; i++)  s = s "\342\226\210";       # full block
+            s = s "\033[2;37m";
+            for (i = n; i < 30; i++) s = s "\342\226\221";       # light shade
+            return s "\033[0m";
         }
+        BEGIN { printf "\033[2J\033[?25l"; cpk = gpk = apk = 0 }
         /^CPU Power:/ { cpu = $3 }
         /^GPU Power:/ { gpu = $3 }
         /^ANE Power:/ {
             ane = $3;
+            if (cpu > cpk) cpk = cpu;
+            if (gpu > gpk) gpk = gpu;
+            if (ane > apk) apk = ane;
             cmd = "date +%H:%M:%S"; cmd | getline ts; close(cmd);
-            printf "%s  CPU %6.2f W |%s|  GPU %5.2f W |%s|  ANE %5.0f mW |%s|\n",
-                ts, cpu/1000, bar(cpu, 12000),
-                gpu/1000, bar(gpu, 4000), ane, bar(ane, 1000);
+            printf "\033[H";
+            printf "\033[1m  Browser LLM power \342\200\224 Apple M3\033[0m              %s   \n\n", ts;
+            printf "  \033[36mCPU\033[0m %7.2f W   %s  12 W   \n",  cpu/1000, bar(cpu, 12000, "\033[36m");
+            printf "  \033[32mGPU\033[0m %7.2f W   %s   4 W   \n",  gpu/1000, bar(gpu,  4000, "\033[32m");
+            printf "  \033[35mANE\033[0m %5.0f   mW  %s   1 W   \n\n", ane,   bar(ane,  1000, "\033[35m");
+            printf "  peaks   CPU %.2f W   GPU %.2f W   ANE %.0f mW        \n", cpk/1000, gpk/1000, apk;
             fflush();
         }'
+    printf "\033[?25h\033[0m\n"
     ;;
 webgpu)
     LOG=/tmp/demo-webgpu.log
