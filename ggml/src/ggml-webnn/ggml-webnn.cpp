@@ -139,11 +139,29 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
                     case 'matmul':
                     {
                         /* ggml mul_mat: dst[n,m] = dot(src0 row m, src1 row n)
-                           JS shapes are [b3, b2, rows, cols]: matmul(src1, src0^T) */
+                           JS shapes are [b3, b2, rows, cols]: matmul(src1, src0^T).
+                           GQA grouped broadcast: split src1's batch dim into
+                           [shared, group], give src0 a size-1 group axis, and let
+                           the rank-5 matmul broadcast (KV heads are read once) */
                         const cdt = n.cdt || 'float32';
                         const w = srcOp(n, 0, cdt);
                         const a = srcOp(n, 1, cdt);
-                        out = b.matmul(a, b.transpose(w, { permutation : [0, 1, 3, 2] }));
+                        const ws = n.ss[0];
+                        const as = n.ss[1];
+                        if (n.g2 > 1 || n.g3 > 1) {
+                            let a5, w5;
+                            if (n.g2 > 1) {
+                                a5 = b.reshape(a, [as[0], ws[1], n.g2, as[2], as[3]]);
+                                w5 = b.reshape(w, [ws[0], ws[1], 1, ws[2], ws[3]]);
+                            } else {
+                                a5 = b.reshape(a, [ws[0], n.g3, as[1], as[2], as[3]]);
+                                w5 = b.reshape(w, [ws[0], 1, ws[1], ws[2], ws[3]]);
+                            }
+                            out = b.matmul(a5, b.transpose(w5, { permutation : [0, 1, 2, 4, 3] }));
+                            out = b.reshape(out, n.shape);
+                        } else {
+                            out = b.matmul(a, b.transpose(w, { permutation : [0, 1, 3, 2] }));
+                        }
                         if (cdt !== n.dt) {
                             out = b.cast(out, n.dt);
                         }
@@ -242,19 +260,45 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
                     case 'flash_attn':
                     {
                         /* softmax(q @ k^T * scale + mask) @ v, heads as batch dim.
-                           q [ns,nh,nt,d], k/v [ns,nh,kv,d|dv], mask [ns,1,nt,kv] */
+                           q [ns,nh,nt,d], k/v [ns,nhkv,kv,d|dv], mask [ns,1,nt,kv].
+                           GQA (g>1): q gains a [nhkv, g] split, k/v a size-1 group
+                           axis, and rank-5 broadcasting shares each KV head */
                         const cdt = n.cdt || 'float32';
-                        const q = srcOp(n, 0, cdt);
-                        const kk = srcOp(n, 1, cdt);
-                        const v = srcOp(n, 2, cdt);
-                        let kq = b.matmul(q, b.transpose(kk, { permutation : [0, 1, 3, 2] }));
+                        let q = srcOp(n, 0, cdt);
+                        let kk = srcOp(n, 1, cdt);
+                        let v = srcOp(n, 2, cdt);
+                        const g = n.g || 1;
+                        const qs = n.ss[0];
+                        const ks = n.ss[1];
+                        let kq;
+                        if (g > 1) {
+                            q = b.reshape(q, [qs[0], ks[1], g, qs[2], qs[3]]);
+                            kk = b.reshape(kk, [ks[0], ks[1], 1, ks[2], ks[3]]);
+                            kq = b.matmul(q, b.transpose(kk, { permutation : [0, 1, 2, 4, 3] }));
+                        } else {
+                            kq = b.matmul(q, b.transpose(kk, { permutation : [0, 1, 3, 2] }));
+                        }
                         if (n.scale !== 1) {
                             kq = b.linear(kq, { alpha : n.scale, beta : 0 });
                         }
                         if (n.src.length > 3) {
-                            kq = b.add(kq, srcOp(n, 3, cdt));
+                            let m = srcOp(n, 3, cdt);
+                            if (g > 1) {
+                                const ms = n.ss[3];
+                                m = b.reshape(m, [ms[0], 1, 1, ms[2], ms[3]]);
+                            }
+                            kq = b.add(kq, m);
                         }
-                        let o = b.matmul(b.softmax(kq, 3), v);             /* [ns, nh, nt, dv] */
+                        const probs = b.softmax(kq, g > 1 ? 4 : 3);
+                        let o;
+                        if (g > 1) {
+                            const vs = n.ss[2];
+                            v = b.reshape(v, [vs[0], vs[1], 1, vs[2], vs[3]]);
+                            o = b.matmul(probs, v);                            /* [ns, nhkv, g, nt, dv] */
+                            o = b.reshape(o, [qs[0], qs[1], qs[2], vs[3]]);    /* [ns, nh, nt, dv] */
+                        } else {
+                            o = b.matmul(probs, v);
+                        }
                         o = b.transpose(o, { permutation : [0, 2, 1, 3] }); /* dst is [ns, nt, nh, dv] */
                         out = cdt !== n.dt ? b.cast(o, n.dt) : o;
                         break;
@@ -492,9 +536,20 @@ static bool ggml_webnn_op_fields(const ggml_tensor * node, std::string & fields)
         case GGML_OP_MUL: fields = "\"op\":\"mul\""; return true;
         case GGML_OP_DIV: fields = "\"op\":\"div\""; return true;
         case GGML_OP_MUL_MAT:
+        {
             fields = std::string("\"op\":\"matmul\",\"cdt\":\"") +
                      (g_webnn_force_f16 ? "float16" : "float32") + "\"";
+            // grouped batch broadcast (GQA): consecutive src1 batches share a src0 batch
+            const ggml_tensor * s0 = node->src[0];
+            const ggml_tensor * s1 = node->src[1];
+            if (s0->ne[2] > 1 && s1->ne[2] != s0->ne[2]) {
+                fields += ",\"g2\":" + std::to_string(s1->ne[2] / s0->ne[2]);
+            }
+            if (s0->ne[3] > 1 && s1->ne[3] != s0->ne[3]) {
+                fields += ",\"g3\":" + std::to_string(s1->ne[3] / s0->ne[3]);
+            }
             return true;
+        }
         case GGML_OP_SCALE:
         {
             float params[2]; // scale, bias
@@ -556,6 +611,10 @@ static bool ggml_webnn_op_fields(const ggml_tensor * node, std::string & fields)
             memcpy(&scale, node->op_params, sizeof(scale));
             fields = "\"op\":\"flash_attn\",\"scale\":" + ggml_webnn_float_js(scale) +
                      ",\"cdt\":\"" + (g_webnn_force_f16 ? "float16" : "float32") + "\"";
+            if (node->src[0]->ne[2] != node->src[1]->ne[2]) {
+                // GQA: query heads per KV head
+                fields += ",\"g\":" + std::to_string(node->src[0]->ne[2] / node->src[1]->ne[2]);
+            }
             return true;
         }
         case GGML_OP_GET_ROWS: fields = "\"op\":\"get_rows\""; return true;
@@ -987,13 +1046,20 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
                 !ggml_webnn_is_float(src1->type) || !ggml_webnn_view_ok(src1)) {
                 return false;
             }
-            // batch dims must match or broadcast src0 across src1
+            // batch dims: equal, plain broadcast (src0 dim 1), or grouped
+            // broadcast (GQA, src1 a multiple of src0) in at most one dim
+            int n_grouped = 0;
             for (int i = 2; i < GGML_MAX_DIMS; i++) {
-                if (src0->ne[i] != src1->ne[i] && src0->ne[i] != 1) {
-                    return false;
+                if (src1->ne[i] == src0->ne[i] || src0->ne[i] == 1) {
+                    continue;
                 }
+                if (src1->ne[i] % src0->ne[i] == 0) {
+                    n_grouped++;
+                    continue;
+                }
+                return false;
             }
-            return true;
+            return n_grouped <= 1;
         }
 
         case GGML_OP_ROPE:
@@ -1038,8 +1104,8 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
                 !ggml_webnn_view_ok(src1) || !ggml_webnn_view_ok(v)) {
                 return false;
             }
-            // no GQA yet: head counts must match
-            if (src0->ne[2] != src1->ne[2] || src1->ne[2] != v->ne[2]) {
+            // query heads must be a multiple of KV heads (GQA via rank-5 broadcast)
+            if (src0->ne[2] % src1->ne[2] != 0 || src1->ne[2] != v->ne[2]) {
                 return false;
             }
             if (mask != nullptr) {

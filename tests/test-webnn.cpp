@@ -436,6 +436,19 @@ int main() {
             ggml_tensor * m = new_input(ctx, "m", in, 32, 5, 1, 1, GGML_TYPE_F16);   // [n_kv, n_tokens]
             return ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/8.0f, 0.0f, 0.0f);
         }},
+        { "mul_mat_gqa", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // grouped batch broadcast: 8 query heads share 2 KV heads (G=4)
+            ggml_tensor * k = new_input(ctx, "k", in, 64, 16, 2, 1);
+            ggml_tensor * q = new_input(ctx, "q", in, 64, 5, 8, 1);
+            return ggml_mul_mat(ctx, k, q);
+        }},
+        { "flash_attn_gqa", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            ggml_tensor * q = new_input(ctx, "q", in, 64, 5, 8, 1);                  // 8 query heads
+            ggml_tensor * k = new_input(ctx, "k", in, 64, 32, 2, 1, GGML_TYPE_F16);  // 2 KV heads
+            ggml_tensor * v = new_input(ctx, "v", in, 64, 32, 2, 1, GGML_TYPE_F16);
+            ggml_tensor * m = new_input(ctx, "m", in, 32, 5, 1, 1, GGML_TYPE_F16);
+            return ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/8.0f, 0.0f, 0.0f);
+        }},
         { "flash_attn_permuted_kv", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
             // K/V as permuted views, like views of the KV cache
             ggml_tensor * q  = new_input(ctx, "q", in, 64, 5, 8, 1);
