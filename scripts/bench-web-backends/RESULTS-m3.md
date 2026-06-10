@@ -1,5 +1,46 @@
 # WebGPU vs WebNN benchmark — Apple M3 MacBook, Chrome 149 (headless)
 
+## Pure-WebNN steady state with quantized weights (commit 364727ce7)
+
+SmolLM2-135M, llama-bench -p 128 -n 64 -r 2 -fa 1 (warmup amortizes
+graph compiles). Q4_0 weights are dequantizeLinear graph constants.
+
+| config                          | pp128 t/s | tg64 t/s | ANE mW avg |
+|---------------------------------|-----------|----------|------------|
+| LiteRT split-mode, f16          | 699       | 14.7     | 0          |
+| LiteRT split-mode, **q4_0**     | 884       | **27.8** | 0          |
+| CoreML chunk=24, f16            | 664       | 9.5      | 228        |
+| **CoreML chunk=24, q4_0**       | **1528**  | **38.1** | 0          |
+| CoreML chunk=24, q4_0 + f16 cast| 479       | 5.8      | 78         |
+| (reference: WebGPU, f16 model)  | 1640      | 118      | 0          |
+| (reference: browser CPU, q4_0)  | ~18 wall  |          | 0          |
+
+Findings:
+
+1. **Quantization roughly doubles decode on every delegate**
+   (LiteRT 14.7 -> 27.8, CoreML 9.5 -> 38.1): compressed-constant
+   execution delivers the bandwidth win, and WebNN decode now beats
+   browser CPU (~2x) for the first time.
+2. **CoreML + chunked graphs + Q4_0 is the fastest pure-WebNN config**:
+   prefill reaches 93% of WebGPU-f16 and decode 32%. The chunking that
+   unlocked CoreML compilation pays off fully once weights are
+   constants.
+3. **The ANE remains f16-bound and slow for LLM shapes**: it engages
+   for f16 graphs (228 mW) at the lowest throughput, and CoreML's fast
+   quantized path bypasses it entirely (0 mW - likely CoreML CPU
+   kernels). Forcing f16 compute over q4 constants re-engages it
+   weakly (78 mW) and tanks throughput. On this hardware/driver stack,
+   the ANE is an energy curiosity for LLM decode, not a throughput
+   device - an honest negative result for the NPU thesis at this
+   model scale.
+4. Implementation lesson recorded in the commit: baked constants carry
+   tensor identity into compiled graphs, so the graph-cache key must
+   include the constant pointers - same-shaped weights across layers
+   otherwise silently share one layer's weights.
+
+TODO for the three-way story: WebGPU q4_0 reference numbers, larger
+GQA models (Qwen 0.5B q4_0), energy/token table across all configs.
+
 ## Cross-model sweep (v3 + GQA, commit 97e9bb3af)
 
 Four f16 models spanning architecture families (llama + qwen2), MHA and
