@@ -37,11 +37,17 @@ and the slowest.
 
 ## Verdicts
 
-1. **WebNN wins prefill on quantized models.** 1950 vs 1523 t/s on
-   SmolLM2-Q4_0 (+28%) and parity at Qwen-0.5B — the first outright WebNN
-   throughput wins over WebGPU in this project. CoreML's compiled graphs with
-   compressed int4 constants beat hand-rolled WGSL at batch compute. Energy
-   per prefill token is at parity (~4.4–4.8 mJ).
+1. **WebNN wins prefill on quantized models — at short-to-medium prompt
+   lengths.** 1950 vs 1523 t/s on SmolLM2-Q4_0 at pp128 (+28%) and parity at
+   Qwen-0.5B — the first outright WebNN throughput wins over WebGPU in this
+   project. CoreML's compiled graphs with compressed int4 constants beat
+   hand-rolled WGSL at batch compute. Energy per prefill token is at parity
+   (~4.4–4.8 mJ). Scope caveat (measured later at pp1024): WebGPU scales
+   better with prompt length — ~2300 vs WebNN's ~1440 t/s at 1024 tokens, as
+   its fixed per-dispatch overhead amortizes while the CoreML int4 path
+   saturates; the crossover lies between 128 and 1024 tokens. Cold-start
+   TTFT is always WebGPU's: WebNN re-pays CoreML graph compilation every
+   page load until graph caching ships.
 2. **WebGPU owns decode**: 3.7–5.8x WebNN throughput and ~5–7x better decode
    energy. WebNN decode (47 t/s) still beats browser CPU by >2x.
 3. **The hybrid is real and simple**: route prefill to WebNN, decode to
