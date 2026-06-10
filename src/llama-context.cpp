@@ -443,6 +443,13 @@ void llama_context::sched_reserve() {
             GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FATTN "-", prefix_len) == 0);
             const int il = std::stoi(n->name + prefix_len);
             ggml_backend_dev_t device_kv = model.dev_layer(il);
+            if (device_fa != device_kv &&
+                ggml_backend_dev_type(device_fa) == GGML_BACKEND_DEVICE_TYPE_ACCEL &&
+                ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(device_fa))) {
+                // host-memory accelerator backends (e.g. WebNN) share buffers with
+                // the CPU layer device; running FA there involves no transfers
+                continue;
+            }
             if (device_fa != device_kv) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the Flash Attention tensor "
                         "is assigned to device %s (usually due to missing support)\n",

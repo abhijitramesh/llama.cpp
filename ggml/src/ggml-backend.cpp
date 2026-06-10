@@ -665,7 +665,9 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS 30
+// raised from 30 for graph-compiling backends (WebNN): weight-heavy subgraphs
+// hit the input cap every layer, fragmenting the graph into per-layer splits
+#define GGML_SCHED_MAX_SPLIT_INPUTS 256
 #endif
 
 #ifndef GGML_SCHED_MAX_COPIES
@@ -1097,7 +1099,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         } else {
             // assigned node: upgrade to higher prio backend if possible
             for (int b = 0; b < *node_backend_id; b++) {
-                if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_supports_op(sched->backends[b], node)) {
+                // two host buffer types are interchangeable for this purpose
+                // (e.g. the WebNN backend's host buffer vs the CPU buffer)
+                const bool same_buft = sched->bufts[b] == sched->bufts[*node_backend_id] ||
+                    (ggml_backend_buft_is_host(sched->bufts[b]) && ggml_backend_buft_is_host(sched->bufts[*node_backend_id]));
+                if (same_buft && ggml_backend_supports_op(sched->backends[b], node)) {
                     bool supported = true;
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
                         struct ggml_tensor * src = node->src[j];

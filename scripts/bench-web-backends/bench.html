@@ -15,6 +15,12 @@ if (q.get('webnn')) {
 if (q.get('f16')) {
     globalThis.GGML_WEBNN_FORCE_F16 = true;
 }
+if (q.get('prune')) {
+    globalThis.GGML_WEBNN_PRUNE = true;
+}
+if (q.get('nosc')) {
+    globalThis.GGML_WEBNN_NO_SCATTER = true;
+}
 var Module = {
     arguments: (q.get('args') || '').split(' ').filter(function(s) { return s.length > 0; }),
     print: function(t) { console.log(t); },

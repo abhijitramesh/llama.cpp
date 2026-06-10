@@ -61,6 +61,15 @@ static void fill_tensor(ggml_tensor * t, uint32_t seed) {
         ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(int32_t));
         return;
     }
+    if (t->type == GGML_TYPE_I64) {
+        // row indices for SET_ROWS
+        std::vector<int64_t> data(n);
+        for (int64_t i = 0; i < n; i++) {
+            data[i] = (i*7 + 3) % 13;
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(int64_t));
+        return;
+    }
     const bool positive = strstr(t->name, "_pos") != nullptr;
     uint32_t state = seed;
     if (t->type == GGML_TYPE_F16) {
@@ -217,6 +226,9 @@ static bool test_intermediate_readback(ggml_backend_t webnn, ggml_backend_t cpu)
         ggml_tensor * z = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
         ggml_tensor * mid = ggml_mul(ctx, x, y);
         ggml_tensor * out = ggml_add(ctx, mid, z);
+        // v4 contract: intermediates consumed within a graph are only
+        // materialized to host when explicitly flagged as outputs
+        ggml_set_output(mid);
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
 
@@ -238,6 +250,54 @@ static bool test_intermediate_readback(ggml_backend_t webnn, ggml_backend_t cpu)
     }
 
     return nmse(mid_ref, mid_out) <= NMSE_DEFAULT && nmse(out_ref, out_out) <= NMSE_DEFAULT;
+}
+
+// SET_ROWS into an f16 cache followed by a matmul reading the cache through a
+// view - the KV-cache write/read pattern (device-resident path on WebNN)
+static bool test_set_rows_then_matmul(ggml_backend_t webnn, ggml_backend_t cpu) {
+    std::vector<float> ref, out_v;
+
+    for (int pass = 0; pass < 2; pass++) {
+        ggml_backend_t backend = pass == 0 ? cpu : webnn;
+        ggml_init_params params = {
+            /* .mem_size   = */ ggml_tensor_overhead()*16 + ggml_graph_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 32);
+        ggml_tensor * rows  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+        ggml_tensor * idx   = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, 4);
+        ggml_tensor * q     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 5);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * sr = ggml_set_rows(ctx, cache, rows, idx);
+        // read the first 16 rows of the (updated) cache through a fresh view
+        ggml_tensor * kv = ggml_view_2d(ctx, cache, 64, 16, cache->nb[1], 0);
+        ggml_tensor * out = ggml_mul_mat(ctx, kv, q);
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, sr);
+        ggml_build_forward_expand(gf, out);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        fill_tensor(cache, 7);
+        fill_tensor(rows, 21);
+        fill_tensor(idx, 0);
+        fill_tensor(q, 35);
+
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return false;
+        }
+        (pass == 0 ? ref : out_v) = read_tensor_f32(out);
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    return nmse(ref, out_v) <= NMSE_MAT_MUL;
 }
 
 int main() {
@@ -268,10 +328,17 @@ int main() {
         ok ? n_ok++ : n_fail++;
     }
 
-    // 2b. intermediate tensors must be readable after graph_compute
+    // 2b. flagged intermediate tensors must be readable after graph_compute
     {
         const bool ok = test_intermediate_readback(webnn, cpu);
         printf("  %-24s %s\n", "intermediate_readback", ok ? "OK" : "FAIL");
+        ok ? n_ok++ : n_fail++;
+    }
+
+    // 2c. KV-cache write/read pattern (SET_ROWS scatter + view read)
+    {
+        const bool ok = test_set_rows_then_matmul(webnn, cpu);
+        printf("  %-24s %s\n", "set_rows_then_matmul", ok ? "OK" : "FAIL");
         ok ? n_ok++ : n_fail++;
     }
 
@@ -411,6 +478,13 @@ int main() {
             ggml_tensor * src = new_input(ctx, "a", in, 64, 16, 1, 1, GGML_TYPE_F16);
             ggml_tensor * idx = new_input(ctx, "i", in, 8, 1, 1, 1, GGML_TYPE_I32);
             return ggml_get_rows(ctx, src, idx);
+        }},
+        { "set_rows", NMSE_DEFAULT, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // f16 cache, f32 rows, i64 indices - the KV-cache write op
+            ggml_tensor * cache = new_input(ctx, "c", in, 64, 32, 1, 1, GGML_TYPE_F16);
+            ggml_tensor * rows  = new_input(ctx, "r", in, 64, 4);
+            ggml_tensor * idx   = new_input(ctx, "i", in, 4, 1, 1, 1, GGML_TYPE_I64);
+            return ggml_set_rows(ctx, cache, rows, idx);
         }},
         { "mul_mat_permuted", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
             // non-contiguous (permuted) src0, the attention KQ pattern
