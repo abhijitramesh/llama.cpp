@@ -2,7 +2,7 @@
 # Live demo runner for the WebGPU / WebNN / hybrid findings on Apple Silicon.
 #
 #   ./demo.sh webgpu   pure WebGPU  - GPU power spikes, ANE stays 0
-#   ./demo.sh webnn    pure WebNN   - ANE engages (~250 mW, f16/NPU config)
+#   ./demo.sh webnn    pure WebNN   - ANE engages (~350 mW; stories15M, fast)
 #   ./demo.sh webnn-q4 pure WebNN   - the prefill speed record (q4, no ANE)
 #   ./demo.sh hybrid   phase split  - ANE spike (prefill), then GPU (decode)
 #   ./demo.sh power    pretty live power meter (sudo; replaces raw powermetrics)
@@ -151,14 +151,16 @@ webnn)
     serve "$ROOT/build-webnn/bin" 9102
     power_start
     T0=$(date +%s)
-    chrome_bench "$WEBNN_FLAGS" 9102 "model=smollm2-135m-f16.gguf&webnn=npu&f16=1&chunk=24&prune=1&args=-m%20/smollm2-135m-f16.gguf%20-p%201024%20-n%20128%20-r%202%20-fa%201%20-ngl%2099" "$LOG"
-    echo ">>> WebNN/ANE: CoreML compiling (~30-60s), then PREFILL (ANE engages)..."
-    wait_for "pp1024" "$LOG"; T_PP=$WAIT_TS
-    echo ">>> PREFILL DONE -- DECODE running (~30s of sustained ANE power, watch mactop)"
-    wait_for "tg128" "$LOG"; T_TG=$WAIT_TS
+    # stories15M: 6 layers -> CoreML compiles in seconds, and the ANE signal
+    # is the strongest of our models (~350 mW). Small model, same proof.
+    chrome_bench "$WEBNN_FLAGS" 9102 "model=stories15M-f16.gguf&webnn=npu&f16=1&chunk=24&prune=1&args=-m%20/stories15M-f16.gguf%20-p%20512%20-n%20256%20-r%204%20-fa%201%20-ngl%2099" "$LOG"
+    echo ">>> WebNN/ANE: CoreML compiling (seconds), then PREFILL (ANE engages)..."
+    wait_for "pp512" "$LOG"; T_PP=$WAIT_TS
+    echo ">>> PREFILL DONE -- DECODE running (~10s of sustained ANE power, watch mactop)"
+    wait_for "tg256" "$LOG"; T_TG=$WAIT_TS
     show_rows "$LOG"
-    phase_power "PREFILL" "pp1024" $((1024 * 3)) "$LOG" "$T_PP" "$T0"
-    phase_power "DECODE"  "tg128"  $((128 * 3))  "$LOG" "$T_TG" "$T_PP"
+    phase_power "PREFILL" "pp512" $((512 * 5))  "$LOG" "$T_PP" "$T0"
+    phase_power "DECODE"  "tg256" $((256 * 5))  "$LOG" "$T_TG" "$T_PP"
     ;;
 webnn-q4)
     LOG=/tmp/demo-webnn-q4.log
@@ -184,18 +186,18 @@ hybrid)
     serve "$ROOT/build-webgpu/bin" 9101
     power_start
     T0=$(date +%s)
-    echo ">>> HYBRID PHASE 1: PREFILL on WebNN/NPU (compile ~30-60s, then ANE spike)"
-    chrome_bench "$WEBNN_FLAGS" 9102 "model=smollm2-135m-f16.gguf&webnn=npu&f16=1&chunk=24&prune=1&args=-m%20/smollm2-135m-f16.gguf%20-p%201024%20-n%200%20-r%203%20-fa%201%20-ngl%2099" "$L1"
-    wait_for "pp1024" "$L1"; T_PP=$WAIT_TS
+    echo ">>> HYBRID PHASE 1: PREFILL on WebNN/NPU (compile seconds, then ANE spike)"
+    chrome_bench "$WEBNN_FLAGS" 9102 "model=stories15M-f16.gguf&webnn=npu&f16=1&chunk=24&prune=1&args=-m%20/stories15M-f16.gguf%20-p%20512%20-n%200%20-r%208%20-fa%201%20-ngl%2099" "$L1"
+    wait_for "pp512" "$L1"; T_PP=$WAIT_TS
     kill "$CHROME_PID" 2>/dev/null
     show_rows "$L1"
-    phase_power "PREFILL" "pp1024" $((1024 * 4)) "$L1" "$T_PP" "$T0"
-    echo ">>> KV HANDOVER (~1.7 MB, ~ms) ... PHASE 2: DECODE on WebGPU (ANE drops, GPU spikes)"
+    phase_power "PREFILL" "pp512" $((512 * 9)) "$L1" "$T_PP" "$T0"
+    echo ">>> KV HANDOVER (~ms) ... PHASE 2: DECODE on WebGPU (ANE drops, GPU spikes)"
     T1=$(date +%s)
-    chrome_bench "" 9101 "model=smollm2-135m-f16.gguf&args=-m%20/smollm2-135m-f16.gguf%20-p%200%20-n%20256%20-r%203%20-ngl%2099" "$L2"
-    wait_for "tg256" "$L2"; T_TG=$WAIT_TS
+    chrome_bench "" 9101 "model=stories15M-f16.gguf&args=-m%20/stories15M-f16.gguf%20-p%200%20-n%20512%20-r%203%20-ngl%2099" "$L2"
+    wait_for "tg512" "$L2"; T_TG=$WAIT_TS
     show_rows "$L2"
-    phase_power "DECODE" "tg256" $((256 * 4)) "$L2" "$T_TG" "$T1"
+    phase_power "DECODE" "tg512" $((512 * 4)) "$L2" "$T_TG" "$T1"
     ;;
 *)
     sed -n '2,18p' "$0"
