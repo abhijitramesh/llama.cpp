@@ -54,8 +54,12 @@ wait_for() { # pattern log -> sets WAIT_TS (epoch seconds when the row appeared)
     WAIT_TS=$(date +%s)
 }
 
-show_rows() { # log
-    grep -E "\| *(pp|tg)[0-9]+" "$1" | sed -E 's/.*CONSOLE:?[0-9()]*\] //; s/", source.*//; s/^"//'
+show_rows() { # log model-name
+    # llama-bench prints the GGUF type string ("llama 256M Q4_0"); show the
+    # actual model name instead
+    grep -E "\| *(pp|tg)[0-9]+" "$1" \
+        | sed -E 's/.*CONSOLE:?[0-9()]*\] //; s/", source.*//; s/^"//' \
+        | sed -E "s/^\| [^|]+\|/| $(printf '%-31s' "${2:-model}")|/"
 }
 
 # --- per-phase power attribution -------------------------------------------
@@ -141,7 +145,7 @@ webgpu)
     wait_for "pp1024" "$LOG"; T_PP=$WAIT_TS
     echo ">>> PREFILL DONE -- DECODE running (watch GPU)"
     wait_for "tg256" "$LOG"; T_TG=$WAIT_TS
-    show_rows "$LOG"
+    show_rows "$LOG" "stories15M Q4_0"
     phase_power "PP128"   "pp128 " $((128 * 5))  "$LOG" "$T_PP1" "$T0"
     phase_power "PP1024"  "pp1024" $((1024 * 5)) "$LOG" "$T_PP" "$T_PP1"
     phase_power "DECODE"  "tg256"  $((256 * 5))  "$LOG" "$T_TG" "$T_PP"
@@ -158,7 +162,7 @@ webnn)
     wait_for "pp512" "$LOG"; T_PP=$WAIT_TS
     echo ">>> PREFILL DONE -- DECODE running (~10s of sustained ANE power, watch mactop)"
     wait_for "tg256" "$LOG"; T_TG=$WAIT_TS
-    show_rows "$LOG"
+    show_rows "$LOG" "stories15M F16 (NPU)"
     phase_power "PREFILL" "pp512" $((512 * 5))  "$LOG" "$T_PP" "$T0"
     phase_power "DECODE"  "tg256" $((256 * 5))  "$LOG" "$T_TG" "$T_PP"
     ;;
@@ -174,7 +178,7 @@ webnn-q4)
     wait_for "pp1024" "$LOG"; T_PP=$WAIT_TS
     echo ">>> PREFILL DONE -- DECODE running (int4 on CPU/GPU units, ANE stays 0)"
     wait_for "tg256" "$LOG"; T_TG=$WAIT_TS
-    show_rows "$LOG"
+    show_rows "$LOG" "stories15M Q4_0"
     phase_power "PP128"   "pp128 " $((128 * 5))  "$LOG" "$T_PP1" "$T0"
     phase_power "PP1024"  "pp1024" $((1024 * 5)) "$LOG" "$T_PP" "$T_PP1"
     phase_power "DECODE"  "tg256"  $((256 * 5))  "$LOG" "$T_TG" "$T_PP"
@@ -190,13 +194,13 @@ hybrid)
     chrome_bench "$WEBNN_FLAGS" 9102 "model=stories15M-f16.gguf&webnn=npu&f16=1&chunk=24&prune=1&args=-m%20/stories15M-f16.gguf%20-p%20512%20-n%200%20-r%208%20-fa%201%20-ngl%2099" "$L1"
     wait_for "pp512" "$L1"; T_PP=$WAIT_TS
     kill "$CHROME_PID" 2>/dev/null
-    show_rows "$L1"
+    show_rows "$L1" "stories15M F16 (NPU)"
     phase_power "PREFILL" "pp512" $((512 * 9)) "$L1" "$T_PP" "$T0"
     echo ">>> KV HANDOVER (~ms) ... PHASE 2: DECODE on WebGPU (ANE drops, GPU spikes)"
     T1=$(date +%s)
     chrome_bench "" 9101 "model=stories15M-f16.gguf&args=-m%20/stories15M-f16.gguf%20-p%200%20-n%20512%20-r%203%20-ngl%2099" "$L2"
     wait_for "tg512" "$L2"; T_TG=$WAIT_TS
-    show_rows "$L2"
+    show_rows "$L2" "stories15M F16"
     phase_power "DECODE" "tg512" $((512 * 4)) "$L2" "$T_TG" "$T1"
     ;;
 *)
