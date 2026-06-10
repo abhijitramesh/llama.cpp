@@ -79,6 +79,73 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
             canScatter : !globalThis.GGML_WEBNN_NO_SCATTER &&
                          typeof MLGraphBuilder !== 'undefined' && typeof MLGraphBuilder.prototype.scatterND === 'function',
         };
+        S.f16 = function(h) {
+            const s = (h & 0x8000) ? -1 : 1;
+            const e = (h >> 10) & 0x1F;
+            const m = h & 0x3FF;
+            if (e === 0) {
+                return s * m * Math.pow(2, -24);
+            }
+            if (e === 31) {
+                return m ? NaN : s * Infinity;
+            }
+            return s * (1024 + m) * Math.pow(2, e - 25);
+        };
+        S.qcache = new Map(); /* 'ptr|fmt|shape' -> repacked weight/scale arrays */
+        /* repack a ggml-quantized weight [n, k] into dequantizeLinear constants.
+           q4_0 blocks: f16 scale + 16 bytes (low nibbles = elems 0..15, high =
+           16..31), value = (q - 8) * scale. q8_0: f16 scale + 32 int8. */
+        S.dequantConst = function(b, q, shape, ptr, nbytes) {
+            const n = shape[0], k = shape[1], nb = k / 32;
+            const key = ptr + '|' + q + '|' + n + 'x' + k;
+            let rec = S.qcache.get(key);
+            if (!rec) {
+                const raw = HEAPU8.subarray(ptr, ptr + nbytes);
+                const scales = new Float32Array(n * nb);
+                if (q === 'q4_0') {
+                    const packed = new Uint8Array(n * k / 2); /* webnn uint4: adjacent pairs, low first */
+                    for (let r = 0; r < n; r++) {
+                        for (let bl = 0; bl < nb; bl++) {
+                            const off = (r * nb + bl) * 18;
+                            scales[r * nb + bl] = S.f16(raw[off] | (raw[off + 1] << 8));
+                            const base = (r * k + bl * 32) >> 1;
+                            for (let j = 0; j < 8; j++) {
+                                const b0 = raw[off + 2 + 2*j];
+                                const b1 = raw[off + 3 + 2*j];
+                                packed[base + j]     = (b0 & 0xF) | ((b1 & 0xF) << 4);
+                                packed[base + 8 + j] = (b0 >> 4) | (b1 & 0xF0);
+                            }
+                        }
+                    }
+                    rec = { wdt : 'uint4', w : packed, scales : scales, zp8 : true, p : ptr, pe : ptr + nbytes };
+                } else {
+                    const w = new Int8Array(n * k);
+                    const i8 = new Int8Array(HEAPU8.buffer, ptr, nbytes);
+                    for (let r = 0; r < n; r++) {
+                        for (let bl = 0; bl < nb; bl++) {
+                            const off = (r * nb + bl) * 34;
+                            scales[r * nb + bl] = S.f16(raw[off] | (raw[off + 1] << 8));
+                            w.set(i8.subarray(off + 2, off + 34), r * k + bl * 32);
+                        }
+                    }
+                    rec = { wdt : 'int8', w : w, scales : scales, zp8 : false, p : ptr, pe : ptr + nbytes };
+                }
+                S.qcache.set(key, rec);
+            }
+            /* constant() may detach its buffer: always hand it a copy, the
+               cached arrays are reused across graph builds */
+            const wq = b.constant({ dataType : rec.wdt, shape : [n, k], dimensions : [n, k] }, rec.w.slice());
+            const sc = b.constant({ dataType : 'float32', shape : [n, nb], dimensions : [n, nb] }, rec.scales.slice());
+            let zpData;
+            if (rec.zp8) {
+                zpData = new Uint8Array((n * nb + 1) >> 1);
+                zpData.fill(0x88);
+            } else {
+                zpData = new Int8Array(n * nb);
+            }
+            const zp = b.constant({ dataType : rec.wdt, shape : [n, nb], dimensions : [n, nb] }, zpData);
+            return b.dequantizeLinear(wq, sc, zp);
+        };
         /* persistent flat MLTensor for a device-resident region; host bytes
            uploaded once at creation, afterwards the device copy is authoritative */
         S.getResident = async function(ptr, dt, shape, nbytes) {
@@ -99,10 +166,18 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
            src ref < 0 means external input -(ref+1), otherwise an earlier node index.
            ss[k] is the shape the consumer wants (reshape applied when it differs),
            sl[k] is an optional element offset (1D slice of the producer). */
-        S.buildGraph = async function(descStr) {
+        S.buildGraph = async function(descStr, inT, nIn) {
             const d = JSON.parse(descStr);
             const b = new MLGraphBuilder(S.context);
+            const constRanges = [];
             const ext = d.ext.map(function(e, i) {
+                if (e.q) {
+                    /* quantized weights baked as dequantized graph constants */
+                    const ptr = HEAPU32[inT + i*3];
+                    const nb = HEAPU32[inT + i*3 + 1];
+                    constRanges.push([ptr, ptr + nb]);
+                    return S.dequantConst(b, e.q, e.shape, ptr, nb);
+                }
                 return b.input('x' + i, { dataType : e.dt, shape : e.shape, dimensions : e.shape });
             });
             const ops = [];
@@ -386,7 +461,7 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
                 outInfo.push(info);
             }
             const entry = {
-                graph : graph, ext : d.ext, outInfo : outInfo,
+                graph : graph, ext : d.ext, outInfo : outInfo, constRanges : constRanges,
                 inKeys : d.ext.map(function(e) { return e.dt + '|' + e.shape.join('x'); }),
             };
             S.graphs.set(descStr, entry);
@@ -440,6 +515,23 @@ EM_JS(void, ggml_webnn_js_invalidate, (void * ptr, size_t size), {
             }
         }
     }
+    /* drop repack caches and graphs whose baked constants overlap the range */
+    if (S.qcache) {
+        for (const e of Array.from(S.qcache.entries())) {
+            if (e[1].p < hi && e[1].pe > lo) {
+                S.qcache.delete(e[0]);
+            }
+        }
+    }
+    for (const e of Array.from(S.graphs.entries())) {
+        const cr = e[1].constRanges || [];
+        for (const r of cr) {
+            if (r[0] < hi && r[1] > lo) {
+                S.graphs.delete(e[0]);
+                break;
+            }
+        }
+    }
 });
 
 // execute one compiled graph: upload changed inputs, dispatch, read all
@@ -458,7 +550,7 @@ EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
 
         let entry = S.graphs.get(descStr);
         if (!entry) {
-            entry = await S.buildGraph(descStr);
+            entry = await S.buildGraph(descStr, inT, n_in);
         }
 
         const feeds = {};
@@ -467,6 +559,9 @@ EM_ASYNC_JS(int, ggml_webnn_js_graph_dispatch,
             const nb = HEAPU32[inT + i*3 + 1];
             const fl = HEAPU32[inT + i*3 + 2];
             const e = entry.ext[i];
+            if (fl & 8) {
+                continue; /* baked as graph constants at build time */
+            }
             if (fl & 2) {
                 /* device-resident region (KV cache): bind the persistent tensor */
                 const rec = await S.getResident(ptr, e.dt, e.shape, nb);
@@ -576,6 +671,17 @@ static const char * ggml_webnn_dt(ggml_type t) {
         case GGML_TYPE_I32: return "int32";
         default:            return nullptr;
     }
+}
+
+// quantized weight types translated to dequantizeLinear graph constants
+static bool ggml_webnn_is_quant(ggml_type t) {
+    return t == GGML_TYPE_Q4_0 || t == GGML_TYPE_Q8_0;
+}
+
+// quantized tensors must be immutable 2D weights with whole blocks per row
+static bool ggml_webnn_quant_ok(const ggml_tensor * t) {
+    return ggml_webnn_is_quant(t->type) && ggml_is_contiguous(t) &&
+           t->ne[1] > 0 && t->ne[2] == 1 && t->ne[3] == 1 && t->ne[0] % 32 == 0;
 }
 
 // JS (row-major) shape of a ggml tensor: reversed ne, e.g. rank 4 -> [ne3,ne2,ne1,ne0]
@@ -1030,6 +1136,34 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
                 ref = -(idx + 1);
                 return true;
             }
+        }
+
+        // quantized weights: repacked into dequantizeLinear graph constants at
+        // build time (data read from the table pointer); logical shape [n, k]
+        if (ggml_webnn_is_quant(t->type)) {
+            if (!ggml_webnn_quant_ok(t)) {
+                return false;
+            }
+            const char * qn = t->type == GGML_TYPE_Q4_0 ? "q4_0" : "q8_0";
+            const std::string shape = "[" + std::to_string(t->ne[1]) + "," + std::to_string(t->ne[0]) + "]";
+            char key[64];
+            snprintf(key, sizeof(key), "%p|%s|", t->data, qn);
+            const std::string k = key + shape;
+            auto eit = ext_idx.find(k);
+            int idx;
+            if (eit != ext_idx.end()) {
+                idx = eit->second;
+            } else {
+                idx = (int) ext_descs.size();
+                ext_idx[k] = idx;
+                ext_descs.push_back("{\"dt\":\"float32\",\"shape\":" + shape + ",\"q\":\"" + qn +
+                                    "\",\"cp\":" + std::to_string((uintptr_t) t->data) + "}");
+                in_tab.push_back((uint32_t) (uintptr_t) t->data);
+                in_tab.push_back((uint32_t) ggml_nbytes(t));
+                in_tab.push_back(8); // baked constant
+            }
+            ref = -(idx + 1);
+            return true;
         }
 
         // external input (leaf, weight, or a tensor computed outside this split);
@@ -1494,8 +1628,9 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
             if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
                 return false;
             }
-            if (!ggml_webnn_is_float(src0->type) || !ggml_webnn_view_ok(src0) ||
-                !ggml_webnn_is_float(src1->type) || !ggml_webnn_view_ok(src1)) {
+            const bool src0_ok = (ggml_webnn_is_float(src0->type) && ggml_webnn_view_ok(src0)) ||
+                                 ggml_webnn_quant_ok(src0);
+            if (!src0_ok || !ggml_webnn_is_float(src1->type) || !ggml_webnn_view_ok(src1)) {
                 return false;
             }
             // batch dims: equal, plain broadcast (src0 dim 1), or grouped
@@ -1638,7 +1773,7 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_GET_ROWS:
             return op->type == GGML_TYPE_F32 &&
-                   ggml_webnn_is_float(src0->type) && ggml_is_contiguous(src0) &&
+                   ((ggml_webnn_is_float(src0->type) && ggml_is_contiguous(src0)) || ggml_webnn_quant_ok(src0)) &&
                    src1->type == GGML_TYPE_I32 && ggml_is_contiguous(src1) &&
                    src0->ne[2] == 1 && src0->ne[3] == 1 &&
                    src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;

@@ -70,6 +70,18 @@ static void fill_tensor(ggml_tensor * t, uint32_t seed) {
         ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(int64_t));
         return;
     }
+    if (t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q8_0) {
+        // quantize deterministic f32 data row by row
+        uint32_t state = seed;
+        std::vector<float> src(n);
+        for (int64_t i = 0; i < n; i++) {
+            src[i] = frand(state);
+        }
+        std::vector<uint8_t> q(ggml_nbytes(t));
+        ggml_quantize_chunk(t->type, src.data(), q.data(), 0, n / t->ne[0], t->ne[0], nullptr);
+        ggml_backend_tensor_set(t, q.data(), 0, q.size());
+        return;
+    }
     const bool positive = strstr(t->name, "_pos") != nullptr;
     uint32_t state = seed;
     if (t->type == GGML_TYPE_F16) {
@@ -473,6 +485,32 @@ int main() {
             // f16 weights x f32 activations -> f32, the standard f16-model matmul
             return ggml_mul_mat(ctx, new_input(ctx, "w", in, 256, 32, 1, 1, GGML_TYPE_F16),
                                      new_input(ctx, "x", in, 256, 16));
+        }},
+        { "mul_mat_q4_0", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // Q4_0 weights become dequantizeLinear graph constants
+            return ggml_mul_mat(ctx, new_input(ctx, "w", in, 256, 32, 1, 1, GGML_TYPE_Q4_0),
+                                     new_input(ctx, "x", in, 256, 16));
+        }},
+        { "mul_mat_q8_0", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            return ggml_mul_mat(ctx, new_input(ctx, "w", in, 256, 32, 1, 1, GGML_TYPE_Q8_0),
+                                     new_input(ctx, "x", in, 256, 16));
+        }},
+        { "mul_mat_q4_0_576", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // model-like shape: k=576 (18 blocks/row, not a power of two)
+            return ggml_mul_mat(ctx, new_input(ctx, "w", in, 576, 64, 1, 1, GGML_TYPE_Q4_0),
+                                     new_input(ctx, "x", in, 576, 5));
+        }},
+        { "mul_mat_q4_0_chain", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // two quantized matmuls chained, like consecutive layer projections
+            ggml_tensor * x  = new_input(ctx, "x", in, 576, 3);
+            ggml_tensor * w1 = new_input(ctx, "w1", in, 576, 1536, 1, 1, GGML_TYPE_Q4_0);
+            ggml_tensor * w2 = new_input(ctx, "w2", in, 1536, 576, 1, 1, GGML_TYPE_Q4_0);
+            return ggml_mul_mat(ctx, w2, ggml_mul_mat(ctx, w1, x));
+        }},
+        { "get_rows_q4_0", NMSE_DEFAULT, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            ggml_tensor * src = new_input(ctx, "a", in, 64, 16, 1, 1, GGML_TYPE_Q4_0);
+            ggml_tensor * idx = new_input(ctx, "i", in, 8, 1, 1, 1, GGML_TYPE_I32);
+            return ggml_get_rows(ctx, src, idx);
         }},
         { "get_rows_f16", NMSE_DEFAULT, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
             ggml_tensor * src = new_input(ctx, "a", in, 64, 16, 1, 1, GGML_TYPE_F16);
