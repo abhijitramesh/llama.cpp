@@ -98,9 +98,27 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
                 if (r < 0) { op = ext[-r - 1]; have = d.ext[-r - 1].shape; }
                 else       { op = ops[r];      have = d.nodes[r].shape; }
                 const want = n.ss[k];
-                if (n.sl && n.sl[k] !== null && n.sl[k] !== undefined) {
+                const sl = n.sl ? n.sl[k] : null;
+                const vp = n.vp ? n.vp[k] : null;
+                if (vp !== null && vp !== undefined) {
+                    /* strided (permuted-dense) view: flatten, slice the span,
+                       restore memory order, then permute to the logical shape */
+                    const total = nel(want);
+                    if (sl !== null && sl !== undefined) {
+                        op = b.reshape(op, [nel(have)]);
+                        op = b.slice(op, [sl], [total]);
+                    } else if (have.length !== 1 || have[0] !== total) {
+                        op = b.reshape(op, [total]);
+                    }
+                    const vshape = [0, 0, 0, 0];
+                    for (let j = 0; j < 4; j++) {
+                        vshape[vp[j]] = want[j];
+                    }
+                    op = b.transpose(b.reshape(op, vshape), { permutation : vp });
+                    have = want;
+                } else if (sl !== null && sl !== undefined) {
                     op = b.reshape(op, [nel(have)]);
-                    op = b.slice(op, [n.sl[k]], [nel(want)]);
+                    op = b.slice(op, [sl], [nel(want)]);
                     have = [nel(want)];
                 }
                 if (!same(have, want)) {
@@ -186,6 +204,59 @@ EM_ASYNC_JS(int, ggml_webnn_js_init, (), {
                         const g = b.slice(x, [0, 0, 0, n.swapped ? half : 0], sizes);
                         const u = b.slice(x, [0, 0, 0, n.swapped ? 0 : half], sizes);
                         out = b.mul(b.mul(g, b.sigmoid(g)), u);
+                        break;
+                    }
+                    case 'rope':
+                    {
+                        /* theta[t,i] = pos[t] * freqs[i]; rotate pairs by (cos,sin)*attn_factor.
+                           mode 0 (NORM) rotates interleaved pairs, mode 2 (NEOX) rotates halves */
+                        const x = srcOp(n, 0, n.dt);          /* [ns, t, h, d] */
+                        const s = n.shape;
+                        const half = s[3] / 2;
+                        const pos = b.cast(b.reshape(srcOp(n, 1, null), [1, s[1], 1, 1]), 'float32');
+                        const freqs = b.constant({ dataType : 'float32', shape : [1, 1, 1, half], dimensions : [1, 1, 1, half] },
+                                                 new Float32Array(n.freqs));
+                        const theta = b.mul(pos, freqs);      /* [1, t, 1, half] */
+                        const cosv = b.linear(b.cos(theta), { alpha : n.af, beta : 0 });
+                        const sinv = b.linear(b.sin(theta), { alpha : n.af, beta : 0 });
+                        const hsize = [s[0], s[1], s[2], half];
+                        let xe, xo;
+                        if (n.mode === 2) {
+                            xe = b.slice(x, [0, 0, 0, 0], hsize);
+                            xo = b.slice(x, [0, 0, 0, half], hsize);
+                        } else {
+                            const x5 = b.reshape(x, [s[0], s[1], s[2], half, 2]);
+                            xe = b.reshape(b.slice(x5, [0, 0, 0, 0, 0], [s[0], s[1], s[2], half, 1]), hsize);
+                            xo = b.reshape(b.slice(x5, [0, 0, 0, 0, 1], [s[0], s[1], s[2], half, 1]), hsize);
+                        }
+                        const oe = b.sub(b.mul(xe, cosv), b.mul(xo, sinv));
+                        const oo = b.add(b.mul(xe, sinv), b.mul(xo, cosv));
+                        if (n.mode === 2) {
+                            out = b.concat([oe, oo], 3);
+                        } else {
+                            const h5 = [s[0], s[1], s[2], half, 1];
+                            out = b.reshape(b.concat([b.reshape(oe, h5), b.reshape(oo, h5)], 4), s);
+                        }
+                        break;
+                    }
+                    case 'flash_attn':
+                    {
+                        /* softmax(q @ k^T * scale + mask) @ v, heads as batch dim.
+                           q [ns,nh,nt,d], k/v [ns,nh,kv,d|dv], mask [ns,1,nt,kv] */
+                        const cdt = n.cdt || 'float32';
+                        const q = srcOp(n, 0, cdt);
+                        const kk = srcOp(n, 1, cdt);
+                        const v = srcOp(n, 2, cdt);
+                        let kq = b.matmul(q, b.transpose(kk, { permutation : [0, 1, 3, 2] }));
+                        if (n.scale !== 1) {
+                            kq = b.linear(kq, { alpha : n.scale, beta : 0 });
+                        }
+                        if (n.src.length > 3) {
+                            kq = b.add(kq, srcOp(n, 3, cdt));
+                        }
+                        let o = b.matmul(b.softmax(kq, 3), v);             /* [ns, nh, nt, dv] */
+                        o = b.transpose(o, { permutation : [0, 2, 1, 3] }); /* dst is [ns, nt, nh, dv] */
+                        out = cdt !== n.dt ? b.cast(o, n.dt) : o;
                         break;
                     }
                     case 'get_rows':
@@ -304,6 +375,7 @@ static bool   g_webnn_available  = false;
 static bool   g_webnn_force_f16  = false;
 static size_t g_webnn_n_ops      = 0; // ggml nodes executed via WebNN
 static size_t g_webnn_n_dispatch = 0; // compiled-graph dispatches
+static std::map<std::string, size_t> g_webnn_op_tally; // per-op execution counts
 
 //
 // graph descriptor encoding
@@ -335,6 +407,67 @@ static std::string ggml_webnn_float_js(float v) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%.9g", v);
     return buf;
+}
+
+// check whether t is a permutation of a dense block of prod(ne) elements
+// starting at t->data (e.g. ggml_permute views, KV cache head-interleaved
+// views). fills the JS transpose permutation that restores logical order.
+static bool ggml_webnn_permuted_contig(const ggml_tensor * t, int perm_out[GGML_MAX_DIMS]) {
+    if (ggml_type_size(t->type) == 0 || ggml_blck_size(t->type) != 1) {
+        return false;
+    }
+    // dims with ne>1, ordered by stride ascending, must form a dense chain
+    int dims[GGML_MAX_DIMS];
+    int n = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (t->ne[i] > 1) {
+            dims[n++] = i;
+        }
+    }
+    for (int a = 0; a < n; a++) {
+        for (int c = a + 1; c < n; c++) {
+            if (t->nb[dims[c]] < t->nb[dims[a]]) {
+                int tmp = dims[a]; dims[a] = dims[c]; dims[c] = tmp;
+            }
+        }
+    }
+    size_t expect = ggml_type_size(t->type);
+    for (int a = 0; a < n; a++) {
+        if (t->nb[dims[a]] != expect) {
+            return false;
+        }
+        expect *= t->ne[dims[a]];
+    }
+    // memory order, outermost first: ne==1 dims placed outermost (stride is moot)
+    int o[GGML_MAX_DIMS];
+    int idx = 0;
+    for (int i = GGML_MAX_DIMS - 1; i >= 0; i--) {
+        if (t->ne[i] == 1) {
+            o[idx++] = i;
+        }
+    }
+    for (int a = n - 1; a >= 0; a--) {
+        o[idx++] = dims[a];
+    }
+    // JS transpose: output (logical) axis j is ggml dim 3-j; find it in memory order
+    for (int j = 0; j < GGML_MAX_DIMS; j++) {
+        for (int k = 0; k < GGML_MAX_DIMS; k++) {
+            if (o[k] == GGML_MAX_DIMS - 1 - j) {
+                perm_out[j] = k;
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+// contiguous, or a strided view we can translate (reshape+transpose)
+static bool ggml_webnn_view_ok(const ggml_tensor * t) {
+    if (ggml_is_contiguous(t)) {
+        return true;
+    }
+    int perm[GGML_MAX_DIMS];
+    return ggml_webnn_permuted_contig(t, perm);
 }
 
 // builder method name for the supported subset of unary ops, NULL otherwise
@@ -396,6 +529,35 @@ static bool ggml_webnn_op_fields(const ggml_tensor * node, std::string & fields)
             }
             return true;
         }
+        case GGML_OP_ROPE:
+        {
+            // mode/freq params checked by supports_op; ext_factor==0, no freq_factors
+            const int32_t * ip = (const int32_t *) node->op_params;
+            const int n_dims = ip[1];
+            const int mode   = ip[2];
+            float freq_base, freq_scale, attn_factor;
+            memcpy(&freq_base,   (const float *) node->op_params + 5, sizeof(float));
+            memcpy(&freq_scale,  (const float *) node->op_params + 6, sizeof(float));
+            memcpy(&attn_factor, (const float *) node->op_params + 8, sizeof(float));
+            fields = "\"op\":\"rope\",\"mode\":" + std::to_string(mode) +
+                     ",\"af\":" + ggml_webnn_float_js(attn_factor) + ",\"freqs\":[";
+            for (int i = 0; i < n_dims/2; i++) {
+                if (i > 0) {
+                    fields += ",";
+                }
+                fields += ggml_webnn_float_js(freq_scale * powf(freq_base, -2.0f*i/n_dims));
+            }
+            fields += "]";
+            return true;
+        }
+        case GGML_OP_FLASH_ATTN_EXT:
+        {
+            float scale;
+            memcpy(&scale, node->op_params, sizeof(scale));
+            fields = "\"op\":\"flash_attn\",\"scale\":" + ggml_webnn_float_js(scale) +
+                     ",\"cdt\":\"" + (g_webnn_force_f16 ? "float16" : "float32") + "\"";
+            return true;
+        }
         case GGML_OP_GET_ROWS: fields = "\"op\":\"get_rows\""; return true;
         case GGML_OP_CPY:
         case GGML_OP_CONT:
@@ -449,6 +611,11 @@ static const char * ggml_backend_webnn_name(ggml_backend_t backend) {
 static void ggml_backend_webnn_free(ggml_backend_t backend) {
     GGML_LOG_INFO("ggml-webnn: %zu ops were executed in %zu WebNN graph dispatches\n",
                   g_webnn_n_ops, g_webnn_n_dispatch);
+    std::string tally;
+    for (const auto & kv : g_webnn_op_tally) {
+        tally += " " + kv.first + ":" + std::to_string(kv.second);
+    }
+    GGML_LOG_INFO("ggml-webnn: op tally:%s\n", tally.c_str());
     delete backend;
 }
 
@@ -476,7 +643,9 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
     // resolve a src tensor to an operand reference:
     //   ref < 0  -> external input -(ref+1)  (data read from host at dispatch)
     //   ref >= 0 -> node index in this split (+ optional 1D element slice)
-    auto resolve = [&](const ggml_tensor * t, int rank, int & ref, int64_t & slice_off) -> bool {
+    // non-contiguous (permuted-dense) views additionally get a JS transpose
+    // permutation in vp_json; their external inputs are declared flat
+    auto resolve = [&](const ggml_tensor * t, int rank, int & ref, int64_t & slice_off, std::string & vp_json) -> bool {
         // walk the view chain, stopping at the FIRST tensor that is a compute
         // node of this split: in-place ops are views of their src0, so walking
         // straight to the root would skip past the producing node
@@ -487,6 +656,18 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
             it = node_idx.find(owner);
         }
         slice_off = -1;
+        vp_json = "null";
+
+        const bool contig = ggml_is_contiguous(t);
+        if (!contig) {
+            int perm[GGML_MAX_DIMS];
+            if (rank != 4 || !ggml_webnn_permuted_contig(t, perm)) {
+                return false;
+            }
+            vp_json = "[" + std::to_string(perm[0]) + "," + std::to_string(perm[1]) + "," +
+                      std::to_string(perm[2]) + "," + std::to_string(perm[3]) + "]";
+        }
+
         if (it != node_idx.end()) {
             if (owner->type != t->type) {
                 return false; // type-punning views are not supported
@@ -501,12 +682,16 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
             }
             return true;
         }
-        // external input (leaf, weight, or a tensor computed outside this split)
+        // external input (leaf, weight, or a tensor computed outside this split);
+        // strided views are declared as their flat dense span
         const char * dt = ggml_webnn_dt(t->type);
         if (dt == nullptr) {
             return false;
         }
-        const std::string shape = ggml_webnn_shape_js(t, rank);
+        const std::string shape = contig ? ggml_webnn_shape_js(t, rank)
+                                         : "[" + std::to_string(ggml_nelements(t)) + "]";
+        const size_t nbytes = contig ? ggml_nbytes(t)
+                                     : (size_t) ggml_nelements(t) * ggml_type_size(t->type);
         char key[64];
         snprintf(key, sizeof(key), "%p|%s|", t->data, dt);
         const std::string k = key + shape;
@@ -523,7 +708,7 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
                 flags |= 1;
             }
             in_tab.push_back((uint32_t) (uintptr_t) t->data);
-            in_tab.push_back((uint32_t) ggml_nbytes(t));
+            in_tab.push_back((uint32_t) nbytes);
             in_tab.push_back(flags);
         }
         ref = -(idx + 1);
@@ -551,12 +736,20 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
         std::string src_json = "[";
         std::string ss_json  = "[";
         std::string sl_json  = "[";
+        std::string vp_json  = "[";
         for (int k = 0; k < n_srcs && node->src[k]; k++) {
-            // per-src rank: GET_ROWS uses rank-2 data + rank-1 indices
-            const int rank = node->op == GGML_OP_GET_ROWS ? (k == 0 ? 2 : 1) : 4;
+            // per-src rank: GET_ROWS uses rank-2 data + rank-1 indices,
+            // ROPE positions are a rank-1 i32 vector
+            int rank = 4;
+            if (node->op == GGML_OP_GET_ROWS) {
+                rank = k == 0 ? 2 : 1;
+            } else if (node->op == GGML_OP_ROPE && k == 1) {
+                rank = 1;
+            }
             int ref;
             int64_t slice_off;
-            if (!resolve(node->src[k], rank, ref, slice_off)) {
+            std::string vp;
+            if (!resolve(node->src[k], rank, ref, slice_off, vp)) {
                 GGML_LOG_ERROR("ggml-webnn: cannot resolve src %d of %s\n", k, ggml_op_desc(node));
                 return GGML_STATUS_FAILED;
             }
@@ -564,14 +757,17 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
                 src_json += ",";
                 ss_json += ",";
                 sl_json += ",";
+                vp_json += ",";
             }
             src_json += std::to_string(ref);
             ss_json  += ggml_webnn_shape_js(node->src[k], rank);
             sl_json  += slice_off < 0 ? "null" : std::to_string(slice_off);
+            vp_json  += vp;
         }
         src_json += "]";
         ss_json += "]";
         sl_json += "]";
+        vp_json += "]";
 
         if (i > 0) {
             desc += ",";
@@ -581,7 +777,8 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
                 ",\"shape\":" + ggml_webnn_shape_js(node, node_rank) +
                 ",\"src\":" + src_json +
                 ",\"ss\":" + ss_json +
-                ",\"sl\":" + sl_json + "}";
+                ",\"sl\":" + sl_json +
+                ",\"vp\":" + vp_json + "}";
     }
 
     // 3. every node is materialized back to host memory
@@ -617,6 +814,9 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
 
     g_webnn_n_ops += nodes.size();
     g_webnn_n_dispatch++;
+    for (const ggml_tensor * node : nodes) {
+        g_webnn_op_tally[ggml_op_desc(node)]++;
+    }
 
     return GGML_STATUS_SUCCESS;
 
@@ -779,13 +979,75 @@ static bool ggml_backend_webnn_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_MUL_MAT:
         {
-            // f32/f16 srcs in any combination, f32 dst
-            if (op->type != GGML_TYPE_F32 || !ggml_webnn_all_float_contig(op)) {
+            // f32/f16 srcs in any combination (strided views allowed), f32 dst
+            if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+                return false;
+            }
+            if (!ggml_webnn_is_float(src0->type) || !ggml_webnn_view_ok(src0) ||
+                !ggml_webnn_is_float(src1->type) || !ggml_webnn_view_ok(src1)) {
                 return false;
             }
             // batch dims must match or broadcast src0 across src1
             for (int i = 2; i < GGML_MAX_DIMS; i++) {
                 if (src0->ne[i] != src1->ne[i] && src0->ne[i] != 1) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        case GGML_OP_ROPE:
+        {
+            // f32, full-width rotation, NORM/NEOX, no yarn, no freq_factors
+            if (op->src[2] != nullptr || op->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_F32) {
+                return false;
+            }
+            const int32_t * ip = (const int32_t *) op->op_params;
+            const int n_dims = ip[1];
+            const int mode   = ip[2];
+            float ext_factor;
+            memcpy(&ext_factor, (const float *) op->op_params + 7, sizeof(float));
+            return (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX) &&
+                   ext_factor == 0.0f &&
+                   n_dims == src0->ne[0] &&
+                   ggml_webnn_view_ok(src0) &&
+                   src1->type == GGML_TYPE_I32 && ggml_is_contiguous(src1) &&
+                   ggml_is_contiguous(op);
+        }
+
+        case GGML_OP_FLASH_ATTN_EXT:
+        {
+            const ggml_tensor * v    = op->src[2];
+            const ggml_tensor * mask = op->src[3];
+            if (op->src[4] != nullptr) {
+                return false; // attention sinks
+            }
+            float max_bias, logit_softcap;
+            memcpy(&max_bias,      (const float *) op->op_params + 1, sizeof(float));
+            memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
+            if (max_bias != 0.0f || logit_softcap != 0.0f) {
+                return false;
+            }
+            if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+                return false;
+            }
+            if (src0->type != GGML_TYPE_F32 || !ggml_webnn_view_ok(src0)) {
+                return false;
+            }
+            if (!ggml_webnn_is_float(src1->type) || v->type != src1->type ||
+                !ggml_webnn_view_ok(src1) || !ggml_webnn_view_ok(v)) {
+                return false;
+            }
+            // no GQA yet: head counts must match
+            if (src0->ne[2] != src1->ne[2] || src1->ne[2] != v->ne[2]) {
+                return false;
+            }
+            if (mask != nullptr) {
+                if (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask)) {
+                    return false;
+                }
+                if (mask->ne[0] != src1->ne[1] || mask->ne[1] != src0->ne[1] || mask->ne[2] != 1 ||
+                    (mask->ne[3] != src0->ne[3] && mask->ne[3] != 1)) {
                     return false;
                 }
             }

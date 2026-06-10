@@ -412,6 +412,40 @@ int main() {
             ggml_tensor * idx = new_input(ctx, "i", in, 8, 1, 1, 1, GGML_TYPE_I32);
             return ggml_get_rows(ctx, src, idx);
         }},
+        { "mul_mat_permuted", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // non-contiguous (permuted) src0, the attention KQ pattern
+            ggml_tensor * a = new_input(ctx, "a", in, 64, 8, 6, 1);
+            ggml_tensor * k = ggml_permute(ctx, a, 0, 2, 1, 3); // [64, 6, 8] strided
+            ggml_tensor * q = new_input(ctx, "q", in, 64, 5, 8, 1);
+            return ggml_mul_mat(ctx, k, q);
+        }},
+        { "rope_norm", NMSE_COMPOSED, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            ggml_tensor * x   = new_input(ctx, "x", in, 48, 6, 4, 1); // [d, n_head, n_tokens]
+            ggml_tensor * pos = new_input(ctx, "p", in, 4, 1, 1, 1, GGML_TYPE_I32);
+            return ggml_rope(ctx, x, pos, 48, GGML_ROPE_TYPE_NORMAL);
+        }},
+        { "rope_neox", NMSE_COMPOSED, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            ggml_tensor * x   = new_input(ctx, "x", in, 48, 6, 4, 1);
+            ggml_tensor * pos = new_input(ctx, "p", in, 4, 1, 1, 1, GGML_TYPE_I32);
+            return ggml_rope(ctx, x, pos, 48, GGML_ROPE_TYPE_NEOX);
+        }},
+        { "flash_attn", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            ggml_tensor * q = new_input(ctx, "q", in, 64, 5, 8, 1);                  // [d, n_tokens, n_head]
+            ggml_tensor * k = new_input(ctx, "k", in, 64, 32, 8, 1, GGML_TYPE_F16);  // [d, n_kv, n_head]
+            ggml_tensor * v = new_input(ctx, "v", in, 64, 32, 8, 1, GGML_TYPE_F16);
+            ggml_tensor * m = new_input(ctx, "m", in, 32, 5, 1, 1, GGML_TYPE_F16);   // [n_kv, n_tokens]
+            return ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/8.0f, 0.0f, 0.0f);
+        }},
+        { "flash_attn_permuted_kv", NMSE_MAT_MUL, [](ggml_context * ctx, std::vector<ggml_tensor *> & in) {
+            // K/V as permuted views, like views of the KV cache
+            ggml_tensor * q  = new_input(ctx, "q", in, 64, 5, 8, 1);
+            ggml_tensor * kc = new_input(ctx, "kc", in, 64, 8, 32, 1, GGML_TYPE_F16); // [d, n_head, n_kv]
+            ggml_tensor * vc = new_input(ctx, "vc", in, 64, 8, 32, 1, GGML_TYPE_F16);
+            ggml_tensor * k  = ggml_permute(ctx, kc, 0, 2, 1, 3); // -> [d, n_kv, n_head] strided
+            ggml_tensor * v  = ggml_permute(ctx, vc, 0, 2, 1, 3);
+            ggml_tensor * m  = new_input(ctx, "m", in, 32, 5, 1, 1, GGML_TYPE_F16);
+            return ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/8.0f, 0.0f, 0.0f);
+        }},
     };
 
     for (const auto & tc : cases) {
