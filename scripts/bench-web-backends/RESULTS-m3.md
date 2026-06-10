@@ -1,5 +1,52 @@
 # WebGPU vs WebNN benchmark — Apple M3 MacBook, Chrome 149 (headless)
 
+## v2 backend: whole-graph compilation + f16 (commit cf6725047 + 36de1d7dc)
+
+Same protocol as v1 below. f16 rows use `stories15M-f16.gguf` (converted
+with llama-quantize); `*-f16` WebNN rows additionally force f16 matmul
+compute (`GGML_WEBNN_FORCE_F16`) and enable Chrome's CoreML delegate.
+
+| config        | pp128 t/s | tg64 t/s | GPU util avg/max % | CPU mW | GPU mW | ANE mW    |
+|---------------|-----------|----------|--------------------|--------|--------|-----------|
+| cpu (f32)     | 1059      | 541      | 7/8                | 6457   | 95     | 0         |
+| cpu-f16       | 324       | 128      | 6/8                | 7603   | 97     | 0         |
+| webnn-default | 2319      | 112      | 7/8                | 7177   | 90     | 0         |
+| webnn-cpu     | 2351      | 112      | 7/10               | 7008   | 94     | 0         |
+| webnn-gpu     | 1932      | 64       | 9/29               | 6711   | 111    | 0         |
+| webnn-npu     | 2357      | 118      | 0/0                | 7156   | 0      | 0         |
+| webnn-gpu-f16 | 2026      | 69       | 7/24               | 6907   | 124    | 0         |
+| webnn-npu-f16 | 2218      | 67       | 8/14               | 7401   | 102    | **376 (peak 926)** |
+| webgpu        | 9002      | 331      | 28/71              | 5502   | 205    | 0         |
+| webgpu-f16    | 8935      | 323      | 32/67              | 5264   | 215    | 0         |
+
+v2 findings:
+
+1. **Whole-graph compilation works**: vs the v1 per-op prototype, WebNN
+   prefill doubled (1213 -> 2319 t/s) and decode improved 3.4x
+   (33 -> 112 t/s). Real llama splits fuse ~6.5 ops per MLGraph dispatch.
+2. **The ANE engaged** — the headline result. `webnn-npu-f16` (f16
+   weights + f16 matmul compute + CoreML delegate + deviceType=npu) is
+   the only configuration in the entire investigation with nonzero ANE
+   power: 376 mW average, 926 mW peak. WebNN demonstrably reaches
+   silicon WebGPU cannot. Every other config (including npu with f32) is
+   0 mW: CoreML only routes f16-friendly graphs to the ANE.
+3. **ANE != faster here**: tg 67 t/s via the ANE vs 112 on WebNN's own
+   CPU path and 331 on WebGPU. At 15M params with host roundtrips per
+   split, ANE dispatch latency dominates; the result is an existence
+   proof and a power-efficiency avenue, not a throughput win at this
+   scale.
+4. WebGPU is unchanged on top (9002/331) and still the lowest system
+   power; f32 vs f16 model makes little difference for it on this
+   bandwidth-light model.
+5. `cpu-f16` collapses to 324/128 t/s (generic wasm CPU has no fast f16
+   path), which makes WebNN-LiteRT (2351/112) genuinely competitive for
+   f16 models in pure-wasm environments — a real niche where WebNN
+   already pays off today.
+
+Remaining caveats: tiny model; decode rankings shift at larger scale;
+KV-length bucketing for true static-shape reuse and device-resident
+tensors (skip host writeback per split) are the next levers.
+
 Model: `tinyllamas/stories15M.gguf` (f32, 24.41M params, 93 MiB).
 `llama-bench -p 128 -n 64 -r 3` via wasm/JSPI builds, 2026-06-09.
 Branch: `webnn-prototype` (WebNN backend = per-op dispatch prototype,
