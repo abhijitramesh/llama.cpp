@@ -27,12 +27,22 @@ Findings:
    constants.
 3. **The ANE remains f16-bound and slow for LLM shapes**: it engages
    for f16 graphs (228 mW) at the lowest throughput, and CoreML's fast
-   quantized path bypasses it entirely (0 mW - likely CoreML CPU
-   kernels). Forcing f16 compute over q4 constants re-engages it
-   weakly (78 mW) and tanks throughput. On this hardware/driver stack,
-   the ANE is an energy curiosity for LLM decode, not a throughput
-   device - an honest negative result for the NPU thesis at this
-   model scale.
+   quantized path bypasses it entirely (0 mW). CORRECTION after
+   literature review: that fast q4 path runs on the **Metal GPU**, not
+   CPU - Apple's docs route per-block int4 dequantizeLinear to GPU,
+   and 38 t/s is GPU-class. Forcing f16 compute over q4 constants
+   re-engages the ANE weakly (78 mW) and tanks throughput. Validated
+   against published ANE research (Orion paper, Apple docs): ANE is
+   architecturally f16-only, ~0.1 ms dispatch overhead per op,
+   matmul 3x slower than conv on ANE, and its fast paths
+   (conv2d-reshaped attention) are unreachable via WebNN. Consensus:
+   ANE suits encoders/batched prefill, GPU suits decode.
+   Delegate-naming caveat: Chromium source has kWebNNCoreML
+   default-ON for Apple Silicon; our plain-flag runs behaved like the
+   in-process TFLite/XNNPACK CPU fallback (fast compiles, no
+   GPU/ANE power). "LiteRT" rows = whatever the plain WebNN flag
+   provides on this box; delegate identity deserves a dump-model
+   verification.
 4. Implementation lesson recorded in the commit: baked constants carry
    tensor identity into compiled graphs, so the graph-cache key must
    include the constant pointers - same-shaped weights across layers
@@ -40,6 +50,39 @@ Findings:
 
 TODO for the three-way story: WebGPU q4_0 reference numbers, larger
 GQA models (Qwen 0.5B q4_0), energy/token table across all configs.
+
+## External validation (June 2026, four-agent literature/issue review)
+
+Validated against Chromium source, W3C WG minutes, ORT WebNN EP, and
+published ANE research:
+
+- Our architecture independently converged on the ecosystem standard:
+  ORT's WebNN EP also bakes int4 weights as dequantizeLinear constants
+  (MatMulNBits decomposition), writes KV via scatterND, and ping-pongs
+  preallocated KV MLTensors. No prior ggml->WebNN art exists; the
+  GGUF-native path is novel and uniquely K-quant-capable (ONNX cannot
+  represent GGUF K-quants, onnx#7691).
+- Per-dispatch IPC overhead (0.5-2 ms) and CoreML's minutes-long
+  compile of large graphs (no caching in Chromium - temp dir per
+  build, webnn#807 open) are documented architecture, validating the
+  chunked-compilation approach (~24-node chunks near the sweet spot).
+- Documented patterns we should adopt: dispatch() and writeTensor()
+  are fire-and-forget - queue all dispatches and await ONE final
+  readTensor; chain chunk outputs as next-chunk MLTensor inputs
+  instead of host roundtrips. We currently await per dispatch.
+- Element-wise scatterND is CPU-emulated on the TFLite path (no native
+  op) - explains the transposed-V scatter pathology.
+- The mask-less GQA flash-attention zeros on the default delegate has
+  no filed bug upstream; worth reporting with a minimal repro.
+- Hybrid correction from published work: the winning phase split is
+  ANE/NPU for PREFILL (batched, 282x GPU power reduction) + GPU for
+  DECODE - the reverse of our earlier sketch. Zero-copy
+  WebNN<->WebGPU interop (createContext(gpuDevice)) is prototyped in
+  Chromium for CoreML but unshipped, so phase-level splitting (one
+  boundary) remains the right hybrid granularity.
+- Dynamic shapes (webnn#883) and graph caching (webnn#807) are
+  2026-roadmap items, unshipped: pre-bucketed static graphs and
+  per-load recompiles are unavoidable today.
 
 ## Cross-model sweep (v3 + GQA, commit 97e9bb3af)
 
