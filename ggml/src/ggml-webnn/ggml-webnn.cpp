@@ -30,6 +30,7 @@
 
 #include <emscripten/emscripten.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -414,6 +415,11 @@ EM_JS(int, ggml_webnn_js_prune, (), {
     return globalThis.GGML_WEBNN_PRUNE ? 1 : 0;
 });
 
+// max nodes per compiled graph (GGML_WEBNN_CHUNK, 0 = whole split)
+EM_JS(int, ggml_webnn_js_chunk, (), {
+    return globalThis.GGML_WEBNN_CHUNK ? Number(globalThis.GGML_WEBNN_CHUNK) : 0;
+});
+
 // drop cached device tensors whose host region overlaps [ptr, ptr+size):
 // called when host memory is freed, cleared or overwritten
 EM_JS(void, ggml_webnn_js_invalidate, (void * ptr, size_t size), {
@@ -553,6 +559,7 @@ static bool   g_webnn_available   = false;
 static bool   g_webnn_force_f16   = false;
 static bool   g_webnn_has_scatter = false;
 static bool   g_webnn_prune       = false; // skip host writeback of consumed intermediates
+static int    g_webnn_chunk       = 0;     // max nodes per compiled graph (0 = whole split)
 static size_t g_webnn_n_ops       = 0; // ggml nodes executed via WebNN
 static size_t g_webnn_n_dispatch  = 0; // compiled-graph dispatches
 static std::map<std::string, size_t> g_webnn_op_tally;  // per-op execution counts
@@ -851,18 +858,49 @@ static void ggml_backend_webnn_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     // 1. collect the compute nodes of this split
-    std::vector<ggml_tensor *> nodes;
-    std::map<const ggml_tensor *, int> node_idx;
+    std::vector<ggml_tensor *> all_nodes;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_webnn_is_noop(node) || ggml_is_empty(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
-        node_idx[node] = (int) nodes.size();
-        nodes.push_back(node);
+        all_nodes.push_back(node);
     }
-    if (nodes.empty()) {
+    if (all_nodes.empty()) {
         return GGML_STATUS_SUCCESS;
+    }
+
+    // 1a. partition into segments of at most GGML_WEBNN_CHUNK nodes, each
+    // compiled and dispatched as its own graph. tensors consumed by a LATER
+    // segment must be materialized to host even when also consumed within
+    // their own segment (the per-segment sink rule cannot see that)
+    const size_t chunk_sz = g_webnn_chunk > 0 ? (size_t) g_webnn_chunk : all_nodes.size();
+    std::vector<bool> cross_seg(all_nodes.size(), false);
+    if (chunk_sz < all_nodes.size()) {
+        std::map<const ggml_tensor *, size_t> global_idx;
+        for (size_t i = 0; i < all_nodes.size(); i++) {
+            global_idx[all_nodes[i]] = i;
+        }
+        for (size_t i = 0; i < all_nodes.size(); i++) {
+            for (int k = 0; k < GGML_MAX_SRC && all_nodes[i]->src[k]; k++) {
+                const ggml_tensor * s = all_nodes[i]->src[k];
+                while (global_idx.find(s) == global_idx.end() && s->view_src) {
+                    s = s->view_src;
+                }
+                auto it = global_idx.find(s);
+                if (it != global_idx.end() && it->second / chunk_sz != i / chunk_sz) {
+                    cross_seg[it->second] = true;
+                }
+            }
+        }
+    }
+    for (size_t seg_base = 0; seg_base < all_nodes.size(); seg_base += chunk_sz) {
+
+    const std::vector<ggml_tensor *> nodes(all_nodes.begin() + seg_base,
+        all_nodes.begin() + std::min(seg_base + chunk_sz, all_nodes.size()));
+    std::map<const ggml_tensor *, int> node_idx;
+    for (size_t i = 0; i < nodes.size(); i++) {
+        node_idx[nodes[i]] = (int) i;
     }
 
     // 1b. device-resident regions: register the root of every SET_ROWS
@@ -1123,7 +1161,7 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
             auto lit = last_scatter.find(node->data);
             is_res = lit != last_scatter.end() && lit->second == (int) i;
         }
-        bool readback = !consumed[i] || (node->flags & GGML_TENSOR_FLAG_OUTPUT);
+        bool readback = !consumed[i] || (node->flags & GGML_TENSOR_FLAG_OUTPUT) || cross_seg[seg_base + i];
         if (!g_webnn_prune && !is_res) {
             readback = true;
         }
@@ -1164,6 +1202,8 @@ static enum ggml_status ggml_backend_webnn_graph_compute(ggml_backend_t backend,
     for (const ggml_tensor * node : nodes) {
         g_webnn_op_tally[ggml_op_desc(node)]++;
     }
+
+    } // segment loop
 
     return GGML_STATUS_SUCCESS;
 
@@ -1728,6 +1768,10 @@ ggml_backend_reg_t ggml_backend_webnn_reg(void) {
             g_webnn_prune = ggml_webnn_js_prune() != 0;
             if (g_webnn_prune) {
                 GGML_LOG_INFO("ggml-webnn: output pruning enabled (GGML_WEBNN_PRUNE)\n");
+            }
+            g_webnn_chunk = ggml_webnn_js_chunk();
+            if (g_webnn_chunk > 0) {
+                GGML_LOG_INFO("ggml-webnn: compiling graphs in chunks of %d nodes (GGML_WEBNN_CHUNK)\n", g_webnn_chunk);
             }
         } else {
             GGML_LOG_WARN("ggml-webnn: navigator.ml is not available, WebNN backend disabled\n");

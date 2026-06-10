@@ -21,6 +21,9 @@ if (q.get('prune')) {
 if (q.get('nosc')) {
     globalThis.GGML_WEBNN_NO_SCATTER = true;
 }
+if (q.get('chunk')) {
+    globalThis.GGML_WEBNN_CHUNK = Number(q.get('chunk'));
+}
 var Module = {
     arguments: (q.get('args') || '').split(' ').filter(function(s) { return s.length > 0; }),
     print: function(t) { console.log(t); },

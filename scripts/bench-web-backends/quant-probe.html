@@ -1,0 +1,161 @@
+<!doctype html>
+<!-- WebNN quantization probe: dequantizeLinear with int8/uint8/int4/uint4
+     inputs, blockwise scales, constant vs input weights.
+     ?webnn=cpu|gpu|npu selects the MLContext deviceType.
+     Logs PROBE: lines to the console. -->
+<html>
+<body>
+<script>
+(async function() {
+    const log = (m) => console.log('PROBE: ' + m);
+    const q = new URLSearchParams(location.search);
+
+    if (!navigator.ml) {
+        log('FATAL navigator.ml unavailable');
+        return;
+    }
+    let context;
+    try {
+        const pref = q.get('webnn');
+        context = pref ? await navigator.ml.createContext({ deviceType: pref })
+                       : await navigator.ml.createContext();
+        log('context created' + (pref ? ' deviceType=' + pref : ' (default)'));
+    } catch (e) {
+        log('FATAL createContext: ' + e);
+        return;
+    }
+
+    log('dequantizeLinear available: ' + (typeof MLGraphBuilder.prototype.dequantizeLinear === 'function'));
+
+    // weights: [R=8, K=32] in blocks of 16 along K -> scales [8, 2]
+    const R = 8, K = 32, BLK = 16, NBLK = K / BLK;
+    // reference int values in [-8, 7] (int4 range), deterministic
+    const wInt = new Int8Array(R * K);
+    for (let i = 0; i < R * K; i++) wInt[i] = (i * 7 + 3) % 15 - 7;
+    const scales = new Float32Array(R * NBLK);
+    for (let i = 0; i < R * NBLK; i++) scales[i] = 0.5 + 0.25 * (i % 3);
+    // reference dequant: (w - zp) * scale, zp = 0
+    const ref = new Float32Array(R * K);
+    for (let r = 0; r < R; r++)
+        for (let k = 0; k < K; k++)
+            ref[r * K + k] = wInt[r * K + k] * scales[r * NBLK + Math.floor(k / BLK)];
+
+    function packData(dtype) {
+        if (dtype === 'int8') return new Int8Array(wInt);
+        if (dtype === 'uint8') { const u = new Uint8Array(R * K); for (let i = 0; i < u.length; i++) u[i] = wInt[i] + 8; return u; }
+        // int4/uint4: two values per byte, low nibble first
+        const packed = new Uint8Array(R * K / 2);
+        for (let i = 0; i < R * K; i += 2) {
+            const a = dtype === 'int4' ? (wInt[i] & 0xF) : (wInt[i] + 8);
+            const b = dtype === 'int4' ? (wInt[i + 1] & 0xF) : (wInt[i + 1] + 8);
+            packed[i / 2] = (a & 0xF) | ((b & 0xF) << 4);
+        }
+        return packed;
+    }
+    function zpData(dtype, n) {
+        if (dtype === 'int8') return new Int8Array(n);
+        if (dtype === 'uint8') { const u = new Uint8Array(n); u.fill(8); return u; }
+        const p = new Uint8Array(Math.ceil(n / 2));
+        if (dtype === 'uint4') p.fill(0x88); // zp=8 in both nibbles
+        return p;
+    }
+    function refFor(dtype) {
+        // uint variants store w+8 with zp=8 -> same dequant values
+        return ref;
+    }
+
+    async function probe(dtype, asConstant, blockwise) {
+        const name = dtype + (asConstant ? '/const' : '/input') + (blockwise ? '/blockwise' : '/per-row');
+        try {
+            const b = new MLGraphBuilder(context);
+            const wDesc = { dataType: dtype, shape: [R, K], dimensions: [R, K] };
+            const sShape = blockwise ? [R, NBLK] : [R, 1];
+            const sData = blockwise ? scales : new Float32Array(Array.from({length: R}, (_, r) => scales[r * NBLK]));
+            const zpShape = sShape;
+            const nzp = sShape[0] * sShape[1];
+
+            const w = asConstant ? b.constant(wDesc, packData(dtype))
+                                 : b.input('w', wDesc);
+            const s = b.constant({ dataType: 'float32', shape: sShape, dimensions: sShape }, sData);
+            const zp = b.constant({ dataType: dtype, shape: zpShape, dimensions: zpShape }, zpData(dtype, nzp));
+            const out = b.dequantizeLinear(w, s, zp);
+            const graph = await b.build({ out: out });
+
+            const feeds = {};
+            if (!asConstant) {
+                const wt = await context.createTensor({ dataType: dtype, shape: [R, K], dimensions: [R, K], writable: true });
+                context.writeTensor(wt, packData(dtype));
+                feeds.w = wt;
+            }
+            const ot = await context.createTensor({ dataType: 'float32', shape: [R, K], dimensions: [R, K], readable: true });
+            context.dispatch(graph, feeds, { out: ot });
+            const got = new Float32Array(await context.readTensor(ot));
+
+            const expect = refFor(dtype);
+            let maxerr = 0;
+            const lim = blockwise ? R * K : R * BLK; // per-row case only checks first block per row
+            for (let i = 0; i < R * K; i++) {
+                const e = blockwise ? expect[i] : wInt[i] * scales[Math.floor(i / K) * NBLK];
+                maxerr = Math.max(maxerr, Math.abs(got[i] - e));
+            }
+            log(name + ': ' + (maxerr < 1e-3 ? 'PASS' : 'WRONG maxerr=' + maxerr));
+        } catch (e) {
+            log(name + ': UNSUPPORTED (' + (e.message || e) + ')');
+        }
+    }
+
+    for (const dt of ['int8', 'uint8', 'int4', 'uint4']) {
+        await probe(dt, true,  true);
+        await probe(dt, false, true);
+        await probe(dt, true,  false);
+    }
+
+    // fused-vs-materialized smell test: time a [2048x2048] int8-const dequant
+    // + matmul vs an f32-const matmul (rough, but a big gap implies materialization is cheap/fused)
+    try {
+        const N = 1024;
+        const big = new Int8Array(N * N);
+        for (let i = 0; i < big.length; i++) big[i] = (i % 255) - 127;
+        const bigScale = new Float32Array(N).fill(0.01);
+
+        const mk = async (quant) => {
+            const b = new MLGraphBuilder(context);
+            const a = b.input('a', { dataType: 'float32', shape: [1, N], dimensions: [1, N] });
+            let w;
+            if (quant) {
+                const wq = b.constant({ dataType: 'int8', shape: [N, N], dimensions: [N, N] }, big);
+                const s = b.constant({ dataType: 'float32', shape: [N, 1], dimensions: [N, 1] }, bigScale);
+                const zp = b.constant({ dataType: 'int8', shape: [N, 1], dimensions: [N, 1] }, new Int8Array(N));
+                w = b.dequantizeLinear(wq, s, zp);
+            } else {
+                const wf = new Float32Array(N * N);
+                for (let i = 0; i < wf.length; i++) wf[i] = ((i % 255) - 127) * 0.01;
+                w = b.constant({ dataType: 'float32', shape: [N, N], dimensions: [N, N] }, wf);
+            }
+            const out = b.matmul(a, b.transpose(w, { permutation: [1, 0] }));
+            return await b.build({ out: out });
+        };
+        for (const quant of [true, false]) {
+            const g = await mk(quant);
+            const at = await context.createTensor({ dataType: 'float32', shape: [1, N], dimensions: [1, N], writable: true });
+            context.writeTensor(at, new Float32Array(N).fill(0.5));
+            const ot = await context.createTensor({ dataType: 'float32', shape: [1, N], dimensions: [1, N], readable: true });
+            context.dispatch(g, { a: at }, { out: ot }); // warmup
+            await context.readTensor(ot);
+            const t0 = performance.now();
+            for (let i = 0; i < 20; i++) {
+                context.dispatch(g, { a: at }, { out: ot });
+            }
+            await context.readTensor(ot);
+            const dt = (performance.now() - t0) / 20;
+            log('matmul1024 ' + (quant ? 'int8-dequant-const' : 'f32-const') + ': ' + dt.toFixed(2) + ' ms/dispatch');
+        }
+    } catch (e) {
+        log('matmul timing: failed (' + (e.message || e) + ')');
+    }
+
+    log('DONE');
+})();
+</script>
+</body>
+</html>
