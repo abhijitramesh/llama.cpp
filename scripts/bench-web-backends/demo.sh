@@ -5,9 +5,10 @@
 #   ./demo.sh webnn    pure WebNN   - ANE engages (~250 mW, f16/NPU config)
 #   ./demo.sh webnn-q4 pure WebNN   - the prefill speed record (q4, no ANE)
 #   ./demo.sh hybrid   phase split  - ANE spike (prefill), then GPU (decode)
+#   ./demo.sh power    pretty live power meter (sudo; replaces raw powermetrics)
 #
 # Run these in side panes first, then start a demo:
-#   sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 1000
+#   ./demo.sh power        (or: sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 1000)
 #   mactop
 #
 # Prefill/decode are separate llama-bench tests: the pp row prints when the
@@ -50,6 +51,27 @@ show_rows() { # log
 }
 
 case "${1:-}" in
+power)
+    # one line per second: timestamp + watts + bars (CPU 12 W / GPU 4 W /
+    # ANE 1 W full scale). ANE > 0 is the money shot for the WebNN demo.
+    exec sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 1000 2>/dev/null | awk '
+        function bar(mw, full,   n, i, s) {
+            n = int(mw * 24 / full); if (n > 24) n = 24;
+            s = "";
+            for (i = 0; i < n; i++) s = s "#";
+            return sprintf("%-24s", s);
+        }
+        /^CPU Power:/ { cpu = $3 }
+        /^GPU Power:/ { gpu = $3 }
+        /^ANE Power:/ {
+            ane = $3;
+            cmd = "date +%H:%M:%S"; cmd | getline ts; close(cmd);
+            printf "%s  CPU %6.2f W |%s|  GPU %5.2f W |%s|  ANE %5.0f mW |%s|\n",
+                ts, cpu/1000, bar(cpu, 12000),
+                gpu/1000, bar(gpu, 4000), ane, bar(ane, 1000);
+            fflush();
+        }'
+    ;;
 webgpu)
     LOG=/tmp/demo-webgpu.log
     serve "$ROOT/build-webgpu/bin" 9101
