@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Live demo runner for the WebGPU / WebNN / hybrid findings on Apple Silicon.
 #
-#   ./demo.sh webgpu   pure WebGPU  - GPU power spikes, ANE stays 0
-#   ./demo.sh webnn    pure WebNN   - ANE engages (~350 mW; stories15M, fast)
-#   ./demo.sh webnn-q4 pure WebNN   - the prefill speed record (q4, no ANE)
-#   ./demo.sh hybrid   phase split  - ANE spike (prefill), then GPU (decode)
+# Matched pairs (same model + precision, compare directly):
+#   Q4_0:  ./demo.sh webgpu     vs  ./demo.sh webnn-q4   (the speed story)
+#   F16:   ./demo.sh webgpu-f16 vs  ./demo.sh webnn      (the silicon story:
+#          ANE is f16-only, so only the webnn f16 config lights it up)
+#   ./demo.sh hybrid   phase split - ANE spike (prefill), then GPU (decode)
 #   ./demo.sh power    pretty live power meter (sudo; replaces raw powermetrics)
 #
 # Run these in side panes first, then start a demo:
@@ -149,6 +150,20 @@ webgpu)
     phase_power "PP128"   "pp128 " $((128 * 5))  "$LOG" "$T_PP1" "$T0"
     phase_power "PP1024"  "pp1024" $((1024 * 5)) "$LOG" "$T_PP" "$T_PP1"
     phase_power "DECODE"  "tg256"  $((256 * 5))  "$LOG" "$T_TG" "$T_PP"
+    ;;
+webgpu-f16)
+    LOG=/tmp/demo-webgpu-f16.log
+    serve "$ROOT/build-webgpu/bin" 9101
+    power_start
+    T0=$(date +%s)
+    chrome_bench "" 9101 "model=stories15M-f16.gguf&args=-m%20/stories15M-f16.gguf%20-p%20512%20-n%20256%20-r%204%20-ngl%2099" "$LOG"
+    echo ">>> WebGPU f16 (matched counterpart of './demo.sh webnn'): PREFILL..."
+    wait_for "pp512" "$LOG"; T_PP=$WAIT_TS
+    echo ">>> PREFILL DONE -- DECODE running (watch GPU; ANE stays 0)"
+    wait_for "tg256" "$LOG"; T_TG=$WAIT_TS
+    show_rows "$LOG" "stories15M F16"
+    phase_power "PREFILL" "pp512" $((512 * 5)) "$LOG" "$T_PP" "$T0"
+    phase_power "DECODE"  "tg256" $((256 * 5)) "$LOG" "$T_TG" "$T_PP"
     ;;
 webnn)
     LOG=/tmp/demo-webnn.log
