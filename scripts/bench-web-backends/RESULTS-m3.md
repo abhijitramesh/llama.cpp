@@ -1,5 +1,47 @@
 # WebGPU vs WebNN benchmark — Apple M3 MacBook, Chrome 149 (headless)
 
+## Cross-model sweep (v3 + GQA, commit 97e9bb3af)
+
+Four f16 models spanning architecture families (llama + qwen2), MHA and
+GQA, 6-30 layers. Configs: wasm CPU, WebNN default (LiteRT), WebNN
+npu + force-f16 (CoreML/ANE), WebGPU. All models generate correct text
+end-to-end with attention/ROPE on WebNN.
+
+Prefill pp128 (t/s):
+
+| model                       | cpu  | webnn | webnn-npu | webgpu | webnn/webgpu | npu ANE mW |
+|-----------------------------|------|-------|-----------|--------|--------------|------------|
+| stories15M (MHA, 6L)        | 320  | 4343  | 4511      | 8918   | 51%          | 353        |
+| stories110M (MHA, 12L)      | 24   | 819   | **1026**  | 2855   | 36%          | 504        |
+| SmolLM2-135M (GQA 9/3, 30L) | 18   | 590   | **651**   | 1640   | 40%          | 260        |
+| Qwen2.5-0.5B (GQA 14/2, 24L)| 5.7  | 162   | **276**   | 876    | 32%          | 291        |
+
+Decode tg64 (t/s):
+
+| model         | cpu  | webnn | webnn-npu | webgpu |
+|---------------|------|-------|-----------|--------|
+| stories15M    | 124  | 77    | 67        | 329    |
+| stories110M   | 18   | 18    | 18        | 176    |
+| SmolLM2-135M  | 14   | 15    | 4.2       | 118    |
+| Qwen2.5-0.5B  | 4.1  | 3.4   | 3.0       | 55     |
+
+Cross-model findings:
+
+1. **WebNN prefill is universally strong**: 14-49x wasm CPU and 32-51%
+   of WebGPU across every model and architecture tested.
+2. **The ANE advantage grows with model size**: npu-f16 beats LiteRT by
+   1.04x at 15M, 1.25x at 110M, 1.7x at Qwen-0.5B — bigger matmuls
+   amortize CoreML dispatch and favor the NPU, exactly the trend the
+   heterogeneous (ANE+GPU) thesis needs. ANE power 260-504 mW sustained.
+3. **Decode is the open front everywhere**: WebNN decode tracks wasm CPU
+   (within noise) because per-layer KV-write splits + materialize-all
+   host writeback dominate; CoreML's higher dispatch latency makes
+   npu decode worst on the 30-layer SmolLM2 (4.2 t/s). This is the v4
+   workload (scatter KV writes in-graph, device-resident MLTensors).
+4. WebGPU GPU power scales with model (128 -> 1921 mW at 0.5B) and it
+   stays the overall throughput/energy champion (~9 vs ~36 mJ/token
+   prefill at 0.5B for WebNN-NPU; wasm CPU is ~1600).
+
 ## v3 backend: attention on WebNN (commit cdc355ab6)
 
 ROPE, FLASH_ATTN_EXT and strided (permuted-dense) views now translate
